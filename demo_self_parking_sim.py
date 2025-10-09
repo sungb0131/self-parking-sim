@@ -8,7 +8,7 @@ import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "0")  # macOS IME 노이즈 억제
 
-import argparse, errno, json, math, random, socket
+import argparse, errno, json, math, random, socket, copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,8 +16,29 @@ import pygame
 from pygame import gfxdraw
 from scipy.io import loadmat
 
+# --------- 폰트 헬퍼 ---------
+FONT_CANDIDATES = [
+    ["Apple SD Gothic Neo", "AppleGothic", "NanumGothic"],
+    ["Noto Sans CJK KR", "Noto Sans KR", "NotoSansKR", "Arial Unicode MS"],
+    ["Malgun Gothic", "Gulim", "UnDotum"],
+]
+
+
+def load_font_with_fallback(size: int, bold: bool = False):
+    """한국어를 포함한 텍스트가 깨지지 않도록 다단계로 폰트를 탐색."""
+    font_path = None
+    for group in FONT_CANDIDATES:
+        font_path = pygame.font.match_font(group, bold=bold)
+        if font_path:
+            break
+    if not font_path:
+        return pygame.font.Font(None, size)
+    return pygame.font.Font(font_path, size)
+
 # Viewport (screen sub-rectangle) for prettier HUD layout; configured in main().
 vp_ox = vp_oy = vp_w = vp_h = None
+
+BASE_MAP_CACHE = {}
 
 # ----------------- 유틸 -----------------
 def clamp(x,a,b): return max(a, min(b,x))
@@ -130,7 +151,7 @@ def draw_overlay(surface, title, lines, font, sw, sh):
         surface.blit(img, (ox + 20, y))
         y += 22
 
-    tip = "Press R to retry, ESC/Q to quit"
+    tip = "R: 재시작  ·  M: 맵 변경  ·  ESC/Q: 종료"
     tip_img = font.render(tip, True, (0, 0, 0))
     surface.blit(tip_img, (ox + 20, oy + ih - 32))
 
@@ -236,6 +257,396 @@ def draw_walls_rects(surface, world, sw, sh, rects):
     for r in rects:
         xmin, xmax, ymin, ymax = float(r[0]), float(r[1]), float(r[2]), float(r[3])
         draw_rect(surface, (xmin, xmax, ymin, ymax), (0,0,0), world, sw, sh, width=0)
+
+def get_base_map(filename: str) -> MapAssets:
+    if filename not in BASE_MAP_CACHE:
+        BASE_MAP_CACHE[filename] = load_parking_assets(filename)
+    return BASE_MAP_CACHE[filename]
+
+def generate_map_thumbnail(M: MapAssets, size=(280, 160), highlight_idx: int | None = None):
+    """맵 레이어를 소형 카드 형태로 미리 렌더링."""
+    width, height = size
+    surface = pygame.Surface((width, height))
+    surface.fill((248, 250, 255))
+
+    xmin, xmax, ymin, ymax = M.extent
+    w_span = max(xmax - xmin, 1e-6)
+    h_span = max(ymax - ymin, 1e-6)
+
+    def to_screen(x, y):
+        sx = (x - xmin) / w_span * (width - 10) + 5
+        sy = (1.0 - (y - ymin) / h_span) * (height - 10) + 5
+        return int(sx), int(sy)
+
+    pygame.draw.rect(surface, (90, 120, 200), pygame.Rect(2, 2, width - 4, height - 4), 2, border_radius=8)
+
+    for idx, rect in enumerate(M.slots):
+        pts = [to_screen(rect[0], rect[2]),
+               to_screen(rect[1], rect[2]),
+               to_screen(rect[1], rect[3]),
+               to_screen(rect[0], rect[3])]
+        if M.occupied_idx[idx]:
+            pygame.draw.polygon(surface, (200, 210, 230), pts)
+        pygame.draw.lines(surface, (110, 130, 180), True, pts, 1)
+
+    if highlight_idx is not None and 0 <= highlight_idx < len(M.slots):
+        rect = M.slots[highlight_idx]
+        pts = [to_screen(rect[0], rect[2]),
+               to_screen(rect[1], rect[2]),
+               to_screen(rect[1], rect[3]),
+               to_screen(rect[0], rect[3])]
+        pygame.draw.polygon(surface, (180, 240, 190), pts)
+        pygame.draw.lines(surface, (60, 140, 60), True, pts, 3)
+
+    # 벽체/라인 표현
+    for r in M.walls_rects:
+        pts = [to_screen(r[0], r[2]),
+               to_screen(r[1], r[2]),
+               to_screen(r[1], r[3]),
+               to_screen(r[0], r[3])]
+        pygame.draw.polygon(surface, (150, 60, 60), pts, 0)
+
+    for x1, y1, x2, y2 in M.lines:
+        pygame.draw.line(surface, (80, 100, 150), to_screen(x1, y1), to_screen(x2, y2), 2)
+
+    border_pts = [to_screen(M.border[0], M.border[2]),
+                  to_screen(M.border[1], M.border[2]),
+                  to_screen(M.border[1], M.border[3]),
+                  to_screen(M.border[0], M.border[3])]
+    pygame.draw.lines(surface, (50, 70, 120), True, border_pts, 3)
+
+    return surface
+
+def apply_map_variant(base: MapAssets, variant: str, seed: int | None = None) -> MapAssets:
+    """기본 맵 자산에 변형을 적용해 다른 난이도/환경을 구성."""
+    if not variant:
+        return base
+    rng = random.Random(seed)
+    M = copy.deepcopy(base)
+
+    if variant == "dense_center":
+        occupied = M.occupied_idx.copy()
+        free_indices = np.where(~occupied)[0]
+        rng.shuffle(free_indices)
+        take = max(4, len(free_indices) // 2)
+        occupied[free_indices[:take]] = True
+        M.occupied_idx = occupied
+    elif variant == "one_way_training":
+        # 중앙 차선에 장애물을 추가해 통로를 제한한다.
+        extras = []
+        lane_y = (M.border[2] + M.border[3]) / 2.0
+        width = 0.8
+        spacing = 4.0
+        x = M.border[0] + 6.0 + rng.uniform(-1.0, 1.0)
+        while x + width < M.border[1] - 6.0:
+            height = rng.uniform(1.0, 2.0)
+            extras.append([x, x + width, lane_y - height, lane_y + height])
+            x += spacing + rng.uniform(-1.0, 1.5)
+        if extras:
+            if M.walls_rects.size == 0:
+                M.walls_rects = np.array(extras, dtype=float)
+            else:
+                M.walls_rects = np.vstack([M.walls_rects, np.array(extras, dtype=float)])
+    elif variant == "open_training":
+        # 거의 모든 점유 슬롯을 비워 넓은 연습장을 만든다.
+        M.occupied_idx = np.zeros_like(M.occupied_idx, dtype=bool)
+    return M
+
+AVAILABLE_MAPS = [
+    {
+        "key": "default_lot",
+        "name": "기본 주차장 75x50",
+        "filename": "parking_assets_layers_75x50.mat",
+        "summary": "균일한 배치의 표준 테스트 환경",
+        "variant": "",
+    },
+    {
+        "key": "dense_lot",
+        "name": "혼잡 주차장",
+        "filename": "parking_assets_layers_75x50.mat",
+        "summary": "주변 슬롯이 가득 찬 협소 환경",
+        "variant": "dense_center",
+    },
+    {
+        "key": "training_course",
+        "name": "장애물 훈련장",
+        "filename": "parking_assets_layers_75x50.mat",
+        "summary": "중앙 통로에 임시 장애물을 배치한 연습 코스",
+        "variant": "one_way_training",
+    },
+]
+
+def build_map_payload(M: MapAssets) -> dict:
+    return {
+        "extent": [float(x) for x in M.extent],
+        "cellSize": float(M.cellSize),
+        "slots": np.array(M.slots).astype(float).tolist(),
+        "occupied_idx": [int(bool(v)) for v in M.occupied_idx],
+        "walls_rects": np.array(M.walls_rects).astype(float).tolist(),
+        "lines": np.array(M.lines).astype(float).tolist(),
+        "grid": {
+            "stationary": M.Cs.astype(float).tolist(),
+            "parked": M.Cp.astype(float).tolist(),
+        },
+    }
+
+def ensure_map_loaded(map_cfg: dict, cache: dict, seed: int | None = None) -> dict:
+    """Load map variant (with optional random seed) and cache the result."""
+    map_key = map_cfg.get("key", map_cfg["filename"])
+    cache_key = (map_key, seed)
+    if cache_key not in cache:
+        base = get_base_map(map_cfg["filename"])
+        variant = map_cfg.get("variant", "")
+        if variant:
+            assets = apply_map_variant(base, variant, seed)
+        else:
+            assets = copy.deepcopy(base)
+        seed_val = seed if seed is not None else 0
+        target_rng = random.Random(seed_val ^ 0x5F3759DF)
+        free_idx = np.where(~assets.occupied_idx)[0]
+        target_idx = int(target_rng.choice(free_idx.tolist())) if free_idx.size > 0 else None
+        payload = build_map_payload(assets)
+        slots_total = int(len(assets.slots))
+        occupied = int(np.count_nonzero(assets.occupied_idx))
+        thumbnail = generate_map_thumbnail(assets, highlight_idx=target_idx)
+        cache[cache_key] = {
+            "assets": assets,
+            "payload": payload,
+            "target_idx": target_idx,
+            "thumbnail": thumbnail,
+            "meta": {
+                "slots_total": slots_total,
+                "occupied_total": occupied,
+            },
+            "seed": seed,
+        }
+    return cache[cache_key]
+
+def compute_map_card_rects(sw: int, sh: int, count: int, margin: int = 48, gap: int = 32):
+    if count <= 0:
+        return []
+    usable_width = max(sw - 2 * margin, 200)
+    card_width = usable_width // count - (gap * (count - 1) // max(count, 1))
+    card_width = max(220, min(320, card_width))
+    total_width = card_width * count + gap * (count - 1)
+    start_x = max(margin, (sw - total_width) // 2)
+    card_height = 320
+    y = sh // 2 - card_height // 2 + 20
+    rects = []
+    for i in range(count):
+        x = start_x + i * (card_width + gap)
+        rects.append(pygame.Rect(x, y, card_width, card_height))
+    return rects
+
+def wrap_text_lines(font, text: str, max_width: int):
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if not candidate:
+            continue
+        if font.size(candidate)[0] <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+def render_map_selection(
+    screen,
+    sw,
+    sh,
+    fonts,
+    maps_cfg,
+    map_cache,
+    map_states,
+    selected_idx,
+    hover_idx,
+    card_rects,
+    error_text=None,
+    connection_text=None,
+    ipc_connected=False,
+):
+    font = fonts["regular"]
+    font_large = fonts["large"]
+    font_title = fonts["title"]
+
+    screen.fill((245, 247, 251))
+    title = font_title.render("주행 맵 선택", True, (30, 36, 80))
+    screen.blit(title, ((sw - title.get_width()) // 2, 48))
+
+    subtitle = font.render("연결 전에 사용할 주행 환경을 선택하세요.", True, (80, 90, 110))
+    screen.blit(subtitle, ((sw - subtitle.get_width()) // 2, 110))
+
+    if connection_text:
+        status_color = (40, 120, 60) if ipc_connected else (200, 60, 60)
+        status_font = fonts["large"]
+        status = status_font.render(connection_text, True, status_color)
+        screen.blit(status, ((sw - status.get_width()) // 2, 150))
+
+    for idx, (cfg, rect) in enumerate(zip(maps_cfg, card_rects)):
+        selected = idx == selected_idx
+        hovered = hover_idx == idx and not selected
+        base_color = (225, 230, 240)
+        if selected:
+            base_color = (210, 220, 245)
+        elif hovered:
+            base_color = (232, 238, 248)
+        pygame.draw.rect(screen, base_color, rect, border_radius=16)
+        border_color = (65, 110, 220) if selected else (160, 180, 205)
+        border_width = 4 if selected else 2
+        pygame.draw.rect(screen, border_color, rect, border_width, border_radius=16)
+
+        name = font_large.render(cfg["name"], True, (20, 30, 50))
+        screen.blit(name, (rect.x + 20, rect.y + 18))
+
+        state = map_states.setdefault(cfg["key"], {"seed": random.randrange(1 << 30)})
+        seed = state["seed"]
+        preview = None
+        preview_error = None
+        bundle = None
+        try:
+            bundle = ensure_map_loaded(cfg, map_cache, seed=seed)
+            preview = bundle.get("thumbnail")
+        except FileNotFoundError:
+            preview_error = "맵 파일을 찾을 수 없습니다."
+        except Exception as exc:
+            preview_error = f"미리보기 실패: {exc}"
+
+        preview_area = pygame.Rect(rect.x + 20, rect.y + 60, rect.width - 40, 160)
+        pygame.draw.rect(screen, (230, 235, 248), preview_area, border_radius=12)
+        pygame.draw.rect(screen, (150, 170, 210), preview_area, 2, border_radius=12)
+        if preview:
+            scaled = pygame.transform.smoothscale(preview, (preview_area.width - 12, preview_area.height - 12))
+            screen.blit(scaled, (preview_area.x + 6, preview_area.y + 6))
+        elif preview_error:
+            msg = font.render(preview_error, True, (170, 50, 50))
+            screen.blit(msg, (preview_area.x + 12, preview_area.y + preview_area.height // 2 - msg.get_height() // 2))
+
+        summary_lines = wrap_text_lines(font, cfg.get("summary", ""), rect.width - 40)
+
+        y = preview_area.bottom + 14
+        for line in summary_lines:
+            surf = font.render(line, True, (55, 65, 90))
+            screen.blit(surf, (rect.x + 20, y))
+            y += 24
+
+        if bundle:
+            meta = bundle.get("meta", {})
+            stats_text = f"전체 슬롯 {meta.get('slots_total', '?')}개 / 점유 {meta.get('occupied_total', '?')}개"
+            stats = font.render(stats_text, True, (100, 110, 140))
+            screen.blit(stats, (rect.x + 20, rect.y + rect.height - 60))
+
+        footer = font.render(f"{idx+1}/{len(maps_cfg)}", True, (120, 130, 150))
+        screen.blit(footer, (rect.x + rect.width - footer.get_width() - 12, rect.y + rect.height - 30))
+
+        if selected:
+            tag = font.render("선택됨", True, (255, 255, 255))
+            tag_rect = pygame.Rect(rect.x + 20, rect.y + rect.height - 38, tag.get_width() + 20, 26)
+            pygame.draw.rect(screen, (65, 110, 220), tag_rect, border_radius=12)
+            screen.blit(tag, (tag_rect.x + 10, tag_rect.y + 4))
+
+    instruction = font.render("← → 또는 A/D: 맵 변경  ·  Enter/Space: 선택  ·  ESC/Q: 종료", True, (70, 80, 95))
+    screen.blit(instruction, ((sw - instruction.get_width()) // 2, sh - 120))
+
+    if error_text:
+        err = font.render(error_text, True, (190, 40, 40))
+        screen.blit(err, ((sw - err.get_width()) // 2, sh - 60))
+
+def map_selection_loop(
+    screen,
+    clock,
+    sw,
+    sh,
+    fonts,
+    maps_cfg,
+    map_cache,
+    map_states,
+    ipc=None,
+    host="127.0.0.1",
+    port=55556,
+    initial_idx=0,
+    error_text=None,
+):
+    selected_idx = min(initial_idx, max(len(maps_cfg) - 1, 0))
+    hovered_idx = None
+    running = True
+    while running:
+        if ipc:
+            try:
+                ipc.poll_accept()
+            except Exception:
+                pass
+
+        card_rects = compute_map_card_rects(sw, sh, len(maps_cfg))
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return None
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return None
+                if event.key in (pygame.K_RIGHT, pygame.K_d):
+                    if maps_cfg:
+                        selected_idx = (selected_idx + 1) % len(maps_cfg)
+                if event.key in (pygame.K_LEFT, pygame.K_a):
+                    if maps_cfg:
+                        selected_idx = (selected_idx - 1) % len(maps_cfg)
+                if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    if maps_cfg:
+                        return selected_idx
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and maps_cfg:
+                for idx, rect in enumerate(card_rects):
+                    if rect.collidepoint(event.pos):
+                        if idx == selected_idx:
+                            return selected_idx
+                        selected_idx = idx
+                        break
+
+        mouse_pos = pygame.mouse.get_pos()
+        hovered_idx = None
+        for idx, rect in enumerate(card_rects):
+            if rect.collidepoint(mouse_pos):
+                hovered_idx = idx
+                break
+
+        if ipc:
+            if ipc.is_connected:
+                peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{host}:{port}"
+                connection_text = f"학생 알고리즘 연결됨 — {peer}"
+                ipc_connected = True
+            else:
+                connection_text = f"학생 알고리즘 연결 대기 중 — {host}:{port}"
+                ipc_connected = False
+        else:
+            connection_text = None
+            ipc_connected = False
+
+        render_map_selection(
+            screen,
+            sw,
+            sh,
+            fonts,
+            maps_cfg,
+            map_cache,
+            map_states,
+            selected_idx,
+            hovered_idx,
+            card_rects,
+            error_text=error_text,
+            connection_text=connection_text,
+            ipc_connected=ipc_connected,
+        )
+        pygame.display.flip()
+        clock.tick(60)
+
+def reseed_map_states(map_states: dict, maps_cfg):
+    for cfg in maps_cfg:
+        map_states[cfg["key"]] = {"seed": random.randrange(1 << 30)}
 
 # ----------------- IPC Controller -----------------
 class IPCController:
@@ -350,25 +761,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 0) 맵 로드
-    M = load_parking_assets("parking_assets_layers_75x50.mat")
-    xmin, xmax, ymin, ymax = M.extent
-    world = (xmin, xmax, ymin, ymax)
-    H, W = M.C.shape
-
-    map_payload = {
-        "extent": [float(x) for x in M.extent],
-        "cellSize": float(M.cellSize),
-        "slots": np.array(M.slots).astype(float).tolist(),
-        "occupied_idx": [int(bool(v)) for v in M.occupied_idx],
-        "walls_rects": np.array(M.walls_rects).astype(float).tolist(),
-        "lines": np.array(M.lines).astype(float).tolist(),
-        "grid": {
-            "stationary": M.Cs.astype(float).tolist(),
-            "parked": M.Cp.astype(float).tolist(),
-        },
-    }
-
     # 1) pygame
     pygame.init()
     pygame.event.set_allowed([pygame.QUIT, pygame.KEYDOWN, pygame.KEYUP])
@@ -376,9 +768,10 @@ def main():
     screen = pygame.display.set_mode((sw, sh))
     pygame.display.set_caption("Self-Parking — Layered Map from MATLAB (IPC)")
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("consolas", 16)
-    font_large = pygame.font.SysFont("consolas", 28)
-    font_title = pygame.font.SysFont("consolas", 48, bold=True)
+    font = load_font_with_fallback(18)
+    font_large = load_font_with_fallback(28, bold=True)
+    font_title = load_font_with_fallback(54, bold=True)
+    fonts = {"regular": font, "large": font_large, "title": font_title}
 
     # Viewport margins so HUD stays outside of the lot rendering area.
     hud_h = 64
@@ -389,16 +782,95 @@ def main():
 
     # ----- 재시작 가능한 라운드 루프 -----
     ipc = IPCController(args.host, args.port) if args.mode == "ipc" else None
-    student_connected = ipc.is_connected if ipc else False
+    map_cache = {}
+    map_states = {}
+    map_seeds_dirty = True
+    selected_map_idx = 0
+    selection_error = None
+    ui_mode = "map_select"
+    M = None
+    map_payload = None
+    world = None
+    H = W = 0
+    current_target_idx = None
+    active_map_cfg = None
     banner_show_until = 0
+    student_connected = ipc.is_connected if ipc else False
     map_sent = False
 
     running=True
     while running:
+        if ui_mode == "map_select":
+            if map_seeds_dirty:
+                reseed_map_states(map_states, AVAILABLE_MAPS)
+                map_cache.clear()
+                map_seeds_dirty = False
+                current_target_idx = None
+                active_map_cfg = None
+            choice = map_selection_loop(
+                screen,
+                clock,
+                sw,
+                sh,
+                fonts,
+                AVAILABLE_MAPS,
+                map_cache,
+                map_states,
+                ipc=ipc if args.mode == "ipc" else None,
+                host=args.host,
+                port=args.port,
+                initial_idx=selected_map_idx,
+                error_text=selection_error,
+            )
+            if choice is None:
+                break
+            selected_map_idx = choice
+            selection_error = None
+            selected_cfg = AVAILABLE_MAPS[selected_map_idx]
+            selected_seed = map_states[selected_cfg["key"]]["seed"]
+            try:
+                bundle = ensure_map_loaded(selected_cfg, map_cache, seed=selected_seed)
+            except FileNotFoundError:
+                missing = selected_cfg["filename"]
+                selection_error = f"맵 파일을 찾을 수 없습니다: {missing}"
+                continue
+            except Exception as e:
+                selection_error = f"맵 로드 실패: {e}"
+                continue
+
+            M = bundle["assets"]
+            map_payload = bundle["payload"]
+            current_target_idx = bundle.get("target_idx")
+            map_states[selected_cfg["key"]]["target_idx"] = current_target_idx
+            active_map_cfg = selected_cfg
+            xmin, xmax, ymin, ymax = M.extent
+            world = (xmin, xmax, ymin, ymax)
+            H, W = M.C.shape
+            ui_mode = "sim_round"
+            banner_show_until = 0
+            student_connected = ipc.is_connected if ipc else False
+            map_sent = False
+            continue
+
+        if M is None:
+            selection_error = "맵이 선택되지 않았습니다."
+            ui_mode = "map_select"
+            map_seeds_dirty = True
+            continue
+
         # 2) 시뮬레이션 라운드 초기화
         P = Params()
         free_slot_indices = [i for i, occ in enumerate(M.occupied_idx) if not occ]
-        target_slot = tuple(M.slots[random.choice(free_slot_indices)].tolist())
+        if not free_slot_indices:
+            raise RuntimeError("맵에 사용 가능한 주차 슬롯이 없습니다.")
+        if current_target_idx in free_slot_indices:
+            target_idx = current_target_idx
+        else:
+            target_idx = random.choice(free_slot_indices)
+            current_target_idx = target_idx
+            if active_map_cfg:
+                map_states[active_map_cfg["key"]]["target_idx"] = current_target_idx
+        target_slot = tuple(M.slots[target_idx].tolist())
 
         # 고정 시작 위치/자세 (좌하단 슬롯 근처, 위쪽을 바라보도록 설정)
         start_x = xmin + 4.0
@@ -591,15 +1063,18 @@ def main():
 
                 blink = (pygame.time.get_ticks() // 400) % 2 == 0
                 status_color = (200, 40, 40) if blink else (255, 160, 160)
-                status_text = "Disconnected - waiting for student algorithm"
+                status_text = "학생 알고리즘 연결 대기 중"
                 status = font_large.render(status_text, True, status_color)
                 status_pos = ((sw - status.get_width()) // 2, title_pos[1] + title.get_height() + 30)
                 screen.blit(status, status_pos)
 
-                info_text = f"Listening on {args.host}:{args.port}"
+                info_text = f"수신 대기: {args.host}:{args.port}"
                 info = font.render(info_text, True, (90, 90, 90))
                 info_pos = ((sw - info.get_width()) // 2, status_pos[1] + status.get_height() + 18)
                 screen.blit(info, info_pos)
+                map_info = font.render(f"선택된 맵: {AVAILABLE_MAPS[selected_map_idx]['name']}", True, (70, 70, 70))
+                map_pos = ((sw - map_info.get_width()) // 2, info_pos[1] + info.get_height() + 16)
+                screen.blit(map_info, map_pos)
             else:
                 screen.fill((245, 245, 245))
 
@@ -640,11 +1115,11 @@ def main():
                 if args.mode == "ipc":
                     if ipc.is_connected:
                         peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
-                        hud3 = f"IPC: connected ({peer})"
+                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 연결: {peer}"
                     else:
-                        hud3 = f"IPC: waiting on {args.host}:{args.port}"
+                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 대기: {args.host}:{args.port}"
                 else:
-                    hud3 = "Mode: WASD (W/S throttle, A/D steer, R gear toggle, SPACE brake)"
+                    hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: WASD (W/S throttle, A/D steer, R gear, SPACE brake)"
 
                 screen.blit(font.render(hud1, True, (0, 0, 0)), (12, 8))
                 screen.blit(font.render(hud2, True, (0, 0, 0)), (12, 26))
@@ -674,6 +1149,7 @@ def main():
             f"Distance: {move_dist:.1f} m",
             f"Collisions: {collision_count}",
         ]
+        info_lines.append(f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}")
         if args.mode == "ipc":
             if ipc and ipc.is_connected:
                 peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
@@ -686,6 +1162,7 @@ def main():
 
         # 대기 루프
         waiting = True
+        return_to_selection = False
         while waiting:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -697,7 +1174,17 @@ def main():
                 waiting = False
             if keys[pygame.K_r]:
                 waiting = False
+            if keys[pygame.K_m]:
+                ui_mode = "map_select"
+                return_to_selection = True
+                waiting = False
             clock.tick(60)
+
+        if return_to_selection:
+            banner_show_until = 0
+            map_sent = False
+            map_seeds_dirty = True
+            continue
 
 
     if ipc:
