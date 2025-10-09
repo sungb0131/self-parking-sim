@@ -40,6 +40,13 @@ vp_ox = vp_oy = vp_w = vp_h = None
 
 BASE_MAP_CACHE = {}
 
+MARKER_COLORS = {
+    "boundary": (200, 60, 60),
+    "occupied_slot": (210, 150, 40),
+    "stationary": (140, 60, 180),
+    "unknown": (80, 80, 80),
+}
+
 # ----------------- 유틸 -----------------
 def clamp(x,a,b): return max(a, min(b,x))
 def wrap_to_pi(a): return (a+math.pi)%(2*math.pi)-math.pi
@@ -258,6 +265,14 @@ def draw_walls_rects(surface, world, sw, sh, rects):
         xmin, xmax, ymin, ymax = float(r[0]), float(r[1]), float(r[2]), float(r[3])
         draw_rect(surface, (xmin, xmax, ymin, ymax), (0,0,0), world, sw, sh, width=0)
 
+def grid_cell_rect(row: int, col: int, extent, cellSize, H):
+    """Convert (row,col) to world-space rectangle."""
+    xmin = extent[0] + col * cellSize
+    xmax = xmin + cellSize
+    ymax = extent[3] - row * cellSize
+    ymin = ymax - cellSize
+    return xmin, xmax, ymin, ymax
+
 def get_base_map(filename: str) -> MapAssets:
     if filename not in BASE_MAP_CACHE:
         BASE_MAP_CACHE[filename] = load_parking_assets(filename)
@@ -421,6 +436,84 @@ def ensure_map_loaded(map_cfg: dict, cache: dict, seed: int | None = None) -> di
             "seed": seed,
         }
     return cache[cache_key]
+
+def detect_stationary_collision(car_poly, M: MapAssets, threshold=0.5):
+    """정지물 레이어와 차량 폴리곤 충돌을 고해상도로 판정한다. [UPDATE] 기존 둘레 샘플링 대신 셀 교차 검사로 정확도를 높였다."""
+    H, W = M.Cs.shape
+    car_x = [p[0] for p in car_poly]
+    car_y = [p[1] for p in car_poly]
+    min_x = clamp(min(car_x), M.extent[0], M.extent[1])
+    max_x = clamp(max(car_x), M.extent[0], M.extent[1])
+    min_y = clamp(min(car_y), M.extent[2], M.extent[3])
+    max_y = clamp(max(car_y), M.extent[2], M.extent[3])
+
+    col_min = int(math.floor((min_x - M.extent[0]) / M.cellSize))
+    col_max = int(math.floor((max_x - M.extent[0]) / M.cellSize))
+    row_min = int(math.floor((M.extent[3] - max_y) / M.cellSize))
+    row_max = int(math.floor((M.extent[3] - min_y) / M.cellSize))
+
+    col_min = clamp(col_min, 0, W - 1)
+    col_max = clamp(col_max, 0, W - 1)
+    row_min = clamp(row_min, 0, H - 1)
+    row_max = clamp(row_max, 0, H - 1)
+
+    for row in range(row_min, row_max + 1):
+        for col in range(col_min, col_max + 1):
+            if M.Cs[row, col] <= threshold:
+                continue
+            rect = grid_cell_rect(row, col, M.extent, M.cellSize, H)
+            if poly_intersects_rect(car_poly, rect):
+                center = ((rect[0] + rect[1]) * 0.5, (rect[2] + rect[3]) * 0.5)
+                return True, center
+    return False, None
+
+def draw_collision_markers(surface, markers, world, sw, sh):
+    """충돌 지점을 시각화한다. [UPDATE] 충돌 위치 확인을 위한 마커 추가."""
+    for marker in markers:
+        mx, my = marker.get("pos", (None, None))
+        if mx is None or my is None:
+            continue
+        reason = marker.get("reason", "unknown")
+        color = MARKER_COLORS.get(reason, MARKER_COLORS["unknown"])
+        sx, sy = world_to_screen(mx, my, world, sw, sh)
+        pygame.draw.circle(surface, color, (sx, sy), 8, 2)
+        pygame.draw.line(surface, color, (sx - 6, sy - 6), (sx + 6, sy + 6), 2)
+        pygame.draw.line(surface, color, (sx - 6, sy + 6), (sx + 6, sy - 6), 2)
+
+def draw_pause_overlay(
+    screen,
+    fonts,
+    sw,
+    sh,
+    stats_lines,
+    instructions,
+):
+    """일시정지 오버레이와 우측 패널을 렌더링."""
+    dim = pygame.Surface((sw, sh), pygame.SRCALPHA)
+    dim.fill((0, 0, 0, 140))
+    screen.blit(dim, (0, 0))
+
+    panel_w = 320
+    panel = pygame.Surface((panel_w, sh), pygame.SRCALPHA)
+    panel.fill((252, 252, 255, 235))
+    screen.blit(panel, (sw - panel_w, 0))
+
+    title_img = fonts["title"].render("PAUSED", True, (40, 60, 140))
+    tx = sw - panel_w + 24
+    ty = 36
+    screen.blit(title_img, (tx, ty))
+    ty += title_img.get_height() + 12
+
+    for line in stats_lines:
+        text_img = fonts["regular"].render(line, True, (55, 65, 90))
+        screen.blit(text_img, (tx, ty))
+        ty += 24
+
+    ty += 24
+    for line in instructions:
+        text_img = fonts["large"].render(line, True, (35, 80, 140))
+        screen.blit(text_img, (tx, ty))
+        ty += 34
 
 def compute_map_card_rects(sw: int, sh: int, count: int, margin: int = 48, gap: int = 32):
     if count <= 0:
@@ -885,36 +978,57 @@ def main():
         move_dist = 0.0
         prev_x, prev_y = state.x, state.y
         collision_count = 0
+        collision_markers = []
+        abort_to_menu = False
+        paused = False
 
         # ---- 메인 주행 루프 ----
         while why == "running":
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     why="quit"; break
-            if why!="running": break
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_p:
+                        paused = not paused
+                        continue
+                    if paused:
+                        if event.key == pygame.K_m:
+                            abort_to_menu = True
+                            why = "to_menu"
+                            break
+                        if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                            why = "quit"
+                            running = False
+                            break
+                if why!="running": break
 
             waiting_for_ipc = False
 
             if args.mode == "wasd":
                 # 키 입력 (디버그/예비용)
                 keys = pygame.key.get_pressed()
-                step_cmd = P.cmdRate * P.dt
-                u.accel = clamp(u.accel + (step_cmd if keys[pygame.K_w] else -step_cmd), 0, 1)
-                u.brake = clamp(u.brake + (step_cmd if keys[pygame.K_s] else -step_cmd), 0, 1)
-                steer_step = math.radians(120) * P.dt
-                if keys[pygame.K_a]:
-                    u.delta_tgt = clamp(u.delta_tgt + steer_step, -P.maxSteer, P.maxSteer)
-                if keys[pygame.K_d]:
-                    u.delta_tgt = clamp(u.delta_tgt - steer_step, -P.maxSteer, P.maxSteer)
-                if not keys[pygame.K_a] and not keys[pygame.K_d]:
+                if not paused:
+                    step_cmd = P.cmdRate * P.dt
+                    u.accel = clamp(u.accel + (step_cmd if keys[pygame.K_w] else -step_cmd), 0, 1)
+                    u.brake = clamp(u.brake + (step_cmd if keys[pygame.K_s] else -step_cmd), 0, 1)
+                    steer_step = math.radians(120) * P.dt
+                    if keys[pygame.K_a]:
+                        u.delta_tgt = clamp(u.delta_tgt + steer_step, -P.maxSteer, P.maxSteer)
+                    if keys[pygame.K_d]:
+                        u.delta_tgt = clamp(u.delta_tgt - steer_step, -P.maxSteer, P.maxSteer)
+                    if not keys[pygame.K_a] and not keys[pygame.K_d]:
+                        u.delta_tgt = move_toward(u.delta_tgt, 0.0, P.selfCenterRate * P.dt)
+                    if keys[pygame.K_r]:
+                        u.gear = 'R' if u.gear == 'D' else 'D'
+                    if keys[pygame.K_SPACE]:
+                        state.v = 0.0
+                        u.accel = 0.0
+                        u.brake = 1.0
+                        u.delta_tgt = 0.0
+                else:
                     u.delta_tgt = move_toward(u.delta_tgt, 0.0, P.selfCenterRate * P.dt)
-                if keys[pygame.K_r]:
-                    u.gear = 'R' if u.gear == 'D' else 'D'
-                if keys[pygame.K_SPACE]:
-                    state.v = 0.0
                     u.accel = 0.0
-                    u.brake = 1.0
-                    u.delta_tgt = 0.0
+                    u.brake = 0.0
             else:
                 # IPC로 명령 수신 (시뮬레이터가 서버 역할 수행)
                 if not ipc.is_connected:
@@ -950,33 +1064,34 @@ def main():
                             waiting_for_ipc = True
                             continue
 
-                    obs = {
-                        "t": t,
-                        "state": {"x": state.x, "y": state.y, "yaw": state.yaw, "v": state.v},
-                        "target_slot": list(target_slot),
-                        "limits": {
-                            "dt": P.dt,
-                            "L": P.L,
-                            "maxSteer": P.maxSteer,
-                            "maxAccel": P.maxAccel,
-                            "maxBrake": P.maxBrake,
-                            "steerRate": P.steerRate,
-                        },
-                    }
-                    try:
-                        ipc.send_obs(obs)
-                        cmd = ipc.recv_cmd()
-                        u.delta_tgt = clamp(float(cmd.get("steer", 0.0)), -P.maxSteer, P.maxSteer)
-                        u.accel = clamp(float(cmd.get("accel", 0.0)), 0.0, 1.0)
-                        u.brake = clamp(float(cmd.get("brake", 0.0)), 0.0, 1.0)
-                        u.gear = 'R' if str(cmd.get("gear", "D")).upper().startswith('R') else 'D'
-                    except Exception as e:
-                        print(f"[IPC] comm fail: {e} -> connection will be reset")
-                        ipc.close_connection()
-                        student_connected = False
-                        banner_show_until = 0
-                        map_sent = False
-                        waiting_for_ipc = True
+                    if not paused:
+                        obs = {
+                            "t": t,
+                            "state": {"x": state.x, "y": state.y, "yaw": state.yaw, "v": state.v},
+                            "target_slot": list(target_slot),
+                            "limits": {
+                                "dt": P.dt,
+                                "L": P.L,
+                                "maxSteer": P.maxSteer,
+                                "maxAccel": P.maxAccel,
+                                "maxBrake": P.maxBrake,
+                                "steerRate": P.steerRate,
+                            },
+                        }
+                        try:
+                            ipc.send_obs(obs)
+                            cmd = ipc.recv_cmd()
+                            u.delta_tgt = clamp(float(cmd.get("steer", 0.0)), -P.maxSteer, P.maxSteer)
+                            u.accel = clamp(float(cmd.get("accel", 0.0)), 0.0, 1.0)
+                            u.brake = clamp(float(cmd.get("brake", 0.0)), 0.0, 1.0)
+                            u.gear = 'R' if str(cmd.get("gear", "D")).upper().startswith('R') else 'D'
+                        except Exception as e:
+                            print(f"[IPC] comm fail: {e} -> connection will be reset")
+                            ipc.close_connection()
+                            student_connected = False
+                            banner_show_until = 0
+                            map_sent = False
+                            waiting_for_ipc = True
                 else:
                     waiting_for_ipc = True
 
@@ -990,7 +1105,7 @@ def main():
             # 조향 레이트 제한
             delta = move_toward(delta, u.delta_tgt, P.steerRate * P.dt)
 
-            if not waiting_for_ipc:
+            if not waiting_for_ipc and not paused:
                 # 가감속 합성(+ coast)
                 sgn = +1.0 if u.gear == 'D' else -1.0
                 a_accel = sgn * P.maxAccel * u.accel
@@ -1018,35 +1133,49 @@ def main():
 
                 # -------- 충돌 판정 --------
                 collided = False
-                # (A) 경계 밖
-                for (x, y) in car_poly:
-                    if not (xmin <= x <= xmax and ymin <= y <= ymax):
+                collision_reason = None
+                collision_marker = None
+
+                # (A) 경계 밖은 즉시 충돌로 유지. [UPDATE] 감지 지점 기록 추가.
+                for (vx, vy) in car_poly:
+                    if not (xmin <= vx <= xmax and ymin <= vy <= ymax):
                         collided = True
+                        collision_reason = "boundary"
+                        collision_marker = (clamp(vx, xmin, xmax), clamp(vy, ymin, ymax))
                         break
-                # (B) 점유된 슬롯 사각형과 SAT 충돌
+
+                # (B) 점유된 슬롯과 SAT 충돌
                 if not collided:
                     for i, rect in enumerate(M.slots):
                         if not M.occupied_idx[i]:
                             continue
                         if poly_intersects_rect(car_poly, tuple(rect)):
                             collided = True
+                            collision_reason = "occupied_slot"
+                            collision_marker = ((rect[0] + rect[1]) * 0.5, (rect[2] + rect[3]) * 0.5)
                             break
-                # (C) 정지물(래스터): 둘레 샘플 → stationary 레이어
+
+                # (C) 정지물 레이어와 고정밀 교차 검사
                 if not collided:
-                    samples = perimeter_points(car_poly, spacing=0.08)
-                    for (x, y) in samples:
-                        r, c = world_to_rc(x, y, M.extent, M.cellSize, H)
-                        if 0 <= r < H and 0 <= c < W and M.Cs[r, c] > 0.5:
-                            collided = True
-                            break
-                # (D) 타깃 슬롯 내부면 충돌 무시
+                    collided, hit_point = detect_stationary_collision(car_poly, M, threshold=M.FreeThr)
+                    if collided:
+                        collision_reason = "stationary"
+                        collision_marker = hit_point
+
+                # (D) 타깃 슬롯 내부는 허용
                 if rect_contains_poly(target_slot, car_poly):
                     collided = False
+                    collision_reason = None
+                    collision_marker = None
 
                 # 성공 판정(간단 버전): 슬롯 완전 포함 + 저속
                 reached = rect_contains_poly(target_slot, car_poly) and abs(state.v) <= 0.2
 
                 if collided:
+                    collision_markers.append({
+                        "pos": collision_marker if collision_marker else (state.x, state.y),
+                        "reason": collision_reason or "unknown",
+                    })
                     collision_count += 1
                     why = "collision"
                     break
@@ -1054,7 +1183,7 @@ def main():
                     why = "success"
                     break
 
-            # ---- 렌더 ----
+        # ---- 렌더 ----
             if args.mode == "ipc" and waiting_for_ipc:
                 screen.fill((255, 255, 255))
                 title = font_title.render("PARKING - SIM", True, (20, 20, 20))
@@ -1075,6 +1204,8 @@ def main():
                 map_info = font.render(f"선택된 맵: {AVAILABLE_MAPS[selected_map_idx]['name']}", True, (70, 70, 70))
                 map_pos = ((sw - map_info.get_width()) // 2, info_pos[1] + info.get_height() + 16)
                 screen.blit(map_info, map_pos)
+                hint = font.render("P: 대기 화면", True, (80, 80, 80))
+                screen.blit(hint, ((sw - hint.get_width()) // 2, map_pos[1] + map_info.get_height() + 16))
             else:
                 screen.fill((245, 245, 245))
 
@@ -1108,6 +1239,8 @@ def main():
                     pygame.draw.lines(screen, (50, 50, 200), False, pts, 2)
 
                 draw_car(screen, state, delta, P, world, sw, sh)
+                if collision_markers:
+                    draw_collision_markers(screen, collision_markers, world, sw, sh)
 
                 # HUD (세 줄 구성)
                 hud1 = f"t={t:5.1f}s  gear={u.gear}  v={state.v:5.2f} m/s  steer={math.degrees(delta):6.1f} deg"
@@ -1120,10 +1253,30 @@ def main():
                         hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 대기: {args.host}:{args.port}"
                 else:
                     hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: WASD (W/S throttle, A/D steer, R gear, SPACE brake)"
+                hud_hint = "P: 대기 화면"
 
                 screen.blit(font.render(hud1, True, (0, 0, 0)), (12, 8))
                 screen.blit(font.render(hud2, True, (0, 0, 0)), (12, 26))
-                screen.blit(font.render(hud3, True, (0, 0, 0)), (12, 44))
+                hud3_img = font.render(hud3, True, (0, 0, 0))
+                screen.blit(hud3_img, (12, 44))
+                hint_img = font.render(hud_hint, True, (70, 70, 70))
+                screen.blit(hint_img, (sw - hint_img.get_width() - 16, 44))
+
+                if paused:
+                    stats_lines = [
+                        f"시간: {t:0.1f} s",
+                        f"속도: {state.v:0.2f} m/s",
+                        f"조향: {math.degrees(delta):0.1f} deg",
+                        f"충돌 횟수: {collision_count}",
+                        f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}",
+                    ]
+                    instruction_lines = [
+                        "P: 계속",
+                        "M: 맵 선택",
+                        "R: 재시작 (라운드 종료 후)",
+                        "ESC/Q: 종료",
+                    ]
+                    draw_pause_overlay(screen, fonts, sw, sh, stats_lines, instruction_lines)
 
                 if args.mode == "ipc" and pygame.time.get_ticks() < banner_show_until:
                     banner = font_large.render("Student algorithm connected!", True, (30, 110, 40))
@@ -1138,10 +1291,34 @@ def main():
                     why = "timeout"
                     break
 
+        if why == "to_menu" or abort_to_menu:
+            ui_mode = "map_select"
+            banner_show_until = 0
+            map_sent = False
+            map_seeds_dirty = True
+            current_target_idx = None
+            active_map_cfg = None
+            continue
+
         # 종료 오버레이
         screen.fill((245, 245, 245))
         pygame.draw.rect(screen, (0, 0, 0), pygame.Rect(vp_ox, vp_oy, vp_w, vp_h), 3)
         draw_rect(screen, M.border, (0, 0, 0), world, sw, sh, width=4)
+        draw_walls_rects(screen, world, sw, sh, M.walls_rects)
+        for x1, y1, x2, y2 in M.lines:
+            p1 = world_to_screen(x1, y1, world, sw, sh)
+            p2 = world_to_screen(x2, y2, world, sw, sh)
+            pygame.draw.line(screen, (0, 0, 0), p1, p2, 3)
+        for i, rect in enumerate(M.slots):
+            if M.occupied_idx[i]:
+                draw_rect(screen, tuple(rect), (0, 0, 0), world, sw, sh, width=0)
+        for rect in M.slots:
+            draw_rect(screen, tuple(rect), (0, 0, 0), world, sw, sh, width=2)
+        draw_rect(screen, target_slot, (180, 255, 180), world, sw, sh, width=0)
+        draw_rect(screen, target_slot, (50, 140, 50), world, sw, sh, width=2)
+        draw_car(screen, state, delta, P, world, sw, sh)
+        if collision_markers:
+            draw_collision_markers(screen, collision_markers, world, sw, sh)
 
         title = "SUCCESS" if why == "success" else ("TIMEOUT" if why == "timeout" else "COLLISION" if why == "collision" else "QUIT")
         info_lines = [
@@ -1174,7 +1351,7 @@ def main():
                 waiting = False
             if keys[pygame.K_r]:
                 waiting = False
-            if keys[pygame.K_m]:
+            if keys[pygame.K_p]:
                 ui_mode = "map_select"
                 return_to_selection = True
                 waiting = False
