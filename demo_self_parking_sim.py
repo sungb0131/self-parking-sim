@@ -9,6 +9,7 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "0")  # macOS IME 노이즈 억제
 
 import argparse, errno, json, math, random, socket, copy
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -39,6 +40,7 @@ def load_font_with_fallback(size: int, bold: bool = False):
 vp_ox = vp_oy = vp_w = vp_h = None
 
 BASE_MAP_CACHE = {}
+RECENT_RESULTS = deque(maxlen=3)
 
 MARKER_COLORS = {
     "boundary": (200, 60, 60),
@@ -187,6 +189,16 @@ class State:
 class InputCmd:
     def __init__(self):
         self.delta_tgt=0.0; self.accel=0.0; self.brake=0.0; self.gear='D'
+
+@dataclass
+class RoundStats:
+    elapsed: float = 0.0
+    distance: float = 0.0
+    gear_switches: int = 0
+    avg_speed_accum: float = 0.0
+    speed_samples: int = 0
+    min_abs_steer: float = float("inf")
+    prev_gear: str = "D"
 
 # ----------------- 모델/차량 -----------------
 def step_kinematic(state: State, delta, a, P: Params):
@@ -374,6 +386,7 @@ AVAILABLE_MAPS = [
         "filename": "parking_assets_layers_75x50.mat",
         "summary": "균일한 배치의 표준 테스트 환경",
         "variant": "",
+        "stage": 1,
     },
     {
         "key": "dense_lot",
@@ -381,6 +394,7 @@ AVAILABLE_MAPS = [
         "filename": "parking_assets_layers_75x50.mat",
         "summary": "주변 슬롯이 가득 찬 협소 환경",
         "variant": "dense_center",
+        "stage": 2,
     },
     {
         "key": "training_course",
@@ -388,8 +402,109 @@ AVAILABLE_MAPS = [
         "filename": "parking_assets_layers_75x50.mat",
         "summary": "중앙 통로에 임시 장애물을 배치한 연습 코스",
         "variant": "one_way_training",
+        "stage": 3,
     },
 ]
+
+STAGE_RULES = {
+    1: {
+        "label": "1단계",
+        "base_score": 100.0,
+        "time_target": 60.0,
+        "distance_factor": 0.85,
+        "turn_target": 2,
+        "speed_target": 2.5,
+        "weights": {
+            "time": 35.0,
+            "distance": 35.0,
+            "turn": 20.0,
+            "speed": 10.0,
+        },
+    },
+    2: {
+        "label": "2단계",
+        "base_score": 100.0,
+        "time_target": 75.0,
+        "distance_factor": 0.95,
+        "turn_target": 3,
+        "speed_target": 3.0,
+        "weights": {
+            "time": 30.0,
+            "distance": 30.0,
+            "turn": 25.0,
+            "speed": 15.0,
+        },
+    },
+    3: {
+        "label": "3단계",
+        "base_score": 100.0,
+        "time_target": 90.0,
+        "distance_factor": 1.05,
+        "turn_target": 4,
+        "speed_target": 3.5,
+        "weights": {
+            "time": 28.0,
+            "distance": 32.0,
+            "turn": 25.0,
+            "speed": 15.0,
+        },
+    },
+}
+
+def get_stage_profile(map_cfg: dict | None):
+    if not map_cfg:
+        return 1, STAGE_RULES[1]
+    stage = int(map_cfg.get("stage", 1))
+    profile = STAGE_RULES.get(stage, STAGE_RULES[1])
+    return stage, profile
+
+def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: str, world_extent) -> tuple[float, dict]:
+    """라운드 종료 시 점수와 지표 상세를 계산한다."""
+    details = {
+        "elapsed": stats.elapsed,
+        "distance": stats.distance,
+        "gear_switches": stats.gear_switches,
+        "avg_speed": (stats.avg_speed_accum / stats.speed_samples) if stats.speed_samples > 0 else 0.0,
+        "reason": result_reason,
+    }
+
+    if result_reason != "success":
+        return 0.0, details
+
+    xmin, xmax, ymin, ymax = world_extent
+    diag = math.hypot(xmax - xmin, ymax - ymin)
+
+    time_target = stage_profile.get("time_target", 1.0)
+    distance_factor = stage_profile.get("distance_factor", 1.0)
+    distance_target = max(1e-6, diag * distance_factor)
+    turn_target = max(1, int(stage_profile.get("turn_target", 1)))
+    speed_target = max(1e-6, float(stage_profile.get("speed_target", 1.0)))
+    weights = stage_profile.get("weights", {})
+
+    time_ratio = stats.elapsed / time_target if time_target > 0 else 0.0
+    dist_ratio = stats.distance / distance_target
+    turn_ratio = stats.gear_switches / turn_target
+    avg_speed = details["avg_speed"]
+    speed_ratio = avg_speed / speed_target
+
+    penalties = (
+        weights.get("time", 0.0) * clamp(time_ratio, 0.0, 2.0) +
+        weights.get("distance", 0.0) * clamp(dist_ratio, 0.0, 2.0) +
+        weights.get("turn", 0.0) * clamp(turn_ratio, 0.0, 2.0) +
+        weights.get("speed", 0.0) * clamp(speed_ratio, 0.0, 2.0)
+    )
+
+    base_score = stage_profile.get("base_score", 100.0)
+    score = clamp(base_score - penalties, 0.0, base_score)
+
+    details.update({
+        "time_ratio": time_ratio,
+        "dist_ratio": dist_ratio,
+        "turn_ratio": turn_ratio,
+        "speed_ratio": speed_ratio,
+        "score": score,
+    })
+    return score, details
 
 def build_map_payload(M: MapAssets) -> dict:
     return {
@@ -981,6 +1096,9 @@ def main():
         collision_markers = []
         abort_to_menu = False
         paused = False
+        round_stats = RoundStats()
+        round_stats.prev_gear = u.gear
+        round_stats.min_abs_steer = abs(delta)
 
         # ---- 메인 주행 루프 ----
         while why == "running":
@@ -1106,6 +1224,11 @@ def main():
             delta = move_toward(delta, u.delta_tgt, P.steerRate * P.dt)
 
             if not waiting_for_ipc and not paused:
+                if u.gear != round_stats.prev_gear:
+                    round_stats.gear_switches += 1
+                    round_stats.prev_gear = u.gear
+                round_stats.min_abs_steer = min(round_stats.min_abs_steer, abs(delta))
+
                 # 가감속 합성(+ coast)
                 sgn = +1.0 if u.gear == 'D' else -1.0
                 a_accel = sgn * P.maxAccel * u.accel
@@ -1127,6 +1250,8 @@ def main():
                 # 이동거리
                 move_dist += math.hypot(state.x - prev_x, state.y - prev_y)
                 prev_x, prev_y = state.x, state.y
+                round_stats.avg_speed_accum += abs(state.v)
+                round_stats.speed_samples += 1
 
                 # 차량 폴리곤(충돌용)
                 car_poly = car_polygon(state, P)
@@ -1290,6 +1415,8 @@ def main():
                 if t >= P.timeout:
                     why = "timeout"
                     break
+                round_stats.elapsed = t
+                round_stats.distance = move_dist
 
         if why == "to_menu" or abort_to_menu:
             ui_mode = "map_select"
@@ -1299,6 +1426,19 @@ def main():
             current_target_idx = None
             active_map_cfg = None
             continue
+
+        round_stats.elapsed = t
+        round_stats.distance = move_dist
+        stage_idx, stage_profile = get_stage_profile(active_map_cfg)
+        score_value, score_details = compute_round_score(round_stats, stage_profile, why, M.extent)
+        RECENT_RESULTS.append({
+            "map": active_map_cfg["name"] if active_map_cfg else "알 수 없음",
+            "stage": stage_idx,
+            "stage_label": stage_profile.get("label", f"{stage_idx}단계"),
+            "score": score_value,
+            "details": score_details,
+            "reason": why,
+        })
 
         # 종료 오버레이
         screen.fill((245, 245, 245))
@@ -1321,11 +1461,24 @@ def main():
             draw_collision_markers(screen, collision_markers, world, sw, sh)
 
         title = "SUCCESS" if why == "success" else ("TIMEOUT" if why == "timeout" else "COLLISION" if why == "collision" else "QUIT")
+        stage_label = stage_profile.get("label", f"{stage_idx}단계")
+        avg_speed = score_details.get("avg_speed", 0.0)
         info_lines = [
-            f"Elapsed: {t:.1f} s",
-            f"Distance: {move_dist:.1f} m",
+            f"Score: {score_value:.1f}",
+            f"Stage: {stage_label}",
+            f"Elapsed: {round_stats.elapsed:.1f} s",
+            f"Distance: {round_stats.distance:.1f} m",
+            f"Gear switches: {round_stats.gear_switches}",
+            f"Avg speed: {avg_speed:.2f} m/s",
             f"Collisions: {collision_count}",
         ]
+        if why == "success":
+            info_lines.extend([
+                f"시간 비율: {score_details.get('time_ratio', 0.0):.2f}",
+                f"거리 비율: {score_details.get('dist_ratio', 0.0):.2f}",
+                f"방향전환 비율: {score_details.get('turn_ratio', 0.0):.2f}",
+                f"속도 비율: {score_details.get('speed_ratio', 0.0):.2f}",
+            ])
         info_lines.append(f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}")
         if args.mode == "ipc":
             if ipc and ipc.is_connected:
@@ -1333,6 +1486,19 @@ def main():
                 info_lines.append(f"IPC connected: {peer}")
             else:
                 info_lines.append(f"IPC waiting on {args.host}:{args.port}")
+
+        if RECENT_RESULTS:
+            info_lines.append("최근 3회 기록:")
+            reason_map = {
+                "success": "성공",
+                "collision": "충돌",
+                "timeout": "시간초과",
+                "quit": "종료",
+            }
+            for entry in reversed(RECENT_RESULTS):
+                label = entry.get("stage_label", "")
+                reason_text = reason_map.get(entry.get("reason"), entry.get("reason", ""))
+                info_lines.append(f"- {label} {entry.get('map', '')}: {entry.get('score', 0.0):.1f}점 ({reason_text})")
 
         draw_overlay(screen, title, info_lines, font, sw, sh)
         pygame.display.flip()
