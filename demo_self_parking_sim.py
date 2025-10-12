@@ -8,10 +8,11 @@ import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "0")  # macOS IME 노이즈 억제
 
-import argparse, errno, json, math, random, socket, copy
+import argparse, errno, json, math, random, socket, copy, subprocess, sys
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pygame
@@ -50,6 +51,214 @@ MARKER_COLORS = {
     "stationary": (140, 60, 180),
     "unknown": (80, 80, 80),
 }
+
+BASE_WINDOW_SIZE = (1600, 1000)
+MIN_WINDOW_SIZE = (1280, 800)
+SIDEBAR_WIDTH_RANGE = (360, 480)
+MAP_CARD_GAP = 20
+MAP_CARD_PADDING = 32
+MAP_CARD_ASPECT = 16 / 9
+ACCENT_COLOR = (65, 110, 220)
+HIGHLIGHT_ALPHA = 80
+
+
+def enforce_min_window_size(width: int, height: int) -> tuple[int, int]:
+    min_w, min_h = MIN_WINDOW_SIZE
+    return max(width, min_w), max(height, min_h)
+
+
+def compute_layout(sw: int, sh: int) -> tuple[pygame.Rect, pygame.Rect]:
+    min_sidebar, max_sidebar = SIDEBAR_WIDTH_RANGE
+    sidebar_width = int(sw * 0.28)
+    sidebar_width = max(min_sidebar, min(sidebar_width, max_sidebar))
+    main_width = sw - sidebar_width
+    if main_width < 720:
+        sidebar_width = max(min_sidebar, sw - 720)
+        main_width = sw - sidebar_width
+    sidebar_width = max(min_sidebar, min(sidebar_width, sw - 480))
+    main_rect = pygame.Rect(0, 0, max(main_width, 480), sh)
+    sidebar_rect = pygame.Rect(main_rect.right, 0, sw - main_rect.width, sh)
+    return main_rect, sidebar_rect
+
+
+def determine_map_columns(window_width: int) -> int:
+    if window_width >= 1400:
+        return 3
+    if window_width >= 980:
+        return 2
+    return 1
+
+
+def ellipsize_text(font: pygame.font.Font, text: str, max_width: int) -> str:
+    if font.size(text)[0] <= max_width:
+        return text
+    ellipsis = "…"
+    ellipsis_width = font.size(ellipsis)[0]
+    if ellipsis_width >= max_width:
+        return ellipsis
+    buf = []
+    for ch in text:
+        buf.append(ch)
+        if font.size("".join(buf))[0] + ellipsis_width > max_width:
+            buf.pop()
+            break
+    return "".join(buf).rstrip() + ellipsis
+
+
+def draw_wrapped_text(
+    surface: pygame.Surface,
+    text: str,
+    font: pygame.font.Font,
+    color: tuple[int, int, int],
+    rect: pygame.Rect,
+    align: str = "left",
+    line_height: float = 1.35,
+    max_lines: int | None = None,
+    ellipsis: bool = True,
+) -> int:
+    if not text or rect.width <= 0:
+        return 0
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        if font.size(candidate)[0] <= rect.width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    if max_lines is not None and len(lines) > max_lines:
+        visible = lines[:max_lines]
+        if ellipsis and visible:
+            visible[-1] = ellipsize_text(font, visible[-1], rect.width)
+        lines = visible
+
+    y = rect.top
+    drawn = 0
+    line_spacing = int(font.get_height() * line_height)
+    for line in lines:
+        if y + font.get_height() > rect.bottom:
+            break
+        text_surface = font.render(line, True, color)
+        if align == "center":
+            x = rect.left + (rect.width - text_surface.get_width()) // 2
+        elif align == "right":
+            x = rect.right - text_surface.get_width()
+        else:
+            x = rect.left
+        surface.blit(text_surface, (x, y))
+        y += line_spacing
+        drawn += 1
+    return drawn
+
+
+def update_viewport(sw: int, sh: int) -> None:
+    global vp_ox, vp_oy, vp_w, vp_h
+    margin = 24
+    hud_h = 64
+    vp_ox = margin
+    vp_oy = hud_h
+    vp_w = max(1, sw - 2 * margin)
+    vp_h = max(1, sh - hud_h - margin)
+
+
+def load_replay_catalog(limit: int = 10) -> list[dict]:
+    root = Path(REPLAY_DIR)
+    if not root.exists():
+        return []
+    try:
+        files = sorted(root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except (OSError, PermissionError):
+        return []
+    entries: list[dict] = []
+    for path in files[:limit]:
+        entry = {"path": path, "meta": {}, "error": None}
+        try:
+            with path.open("r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            meta = data.get("meta", {}) if isinstance(data, dict) else {}
+            entry["meta"] = meta
+        except Exception as exc:
+            entry["error"] = str(exc)
+        entries.append(entry)
+    return entries
+
+
+def discover_agent_entries(base_dir: Path) -> list[dict]:
+    entries: list[dict] = []
+    local_agent = base_dir / "student_algorithms.py"
+    if local_agent.exists():
+        entries.append({
+            "label": "student_algorithms.py (로컬)",
+            "path": local_agent,
+            "cwd": base_dir,
+        })
+    sibling = (base_dir.parent / "self-parking-user-algorithms" / "my_agent.py").resolve()
+    if sibling.exists():
+        entries.append({
+            "label": "self-parking-user-algorithms/my_agent.py",
+            "path": sibling,
+            "cwd": sibling.parent,
+        })
+    return entries
+
+
+class AgentManager:
+    """학생 알고리즘 프로세스를 관리한다."""
+
+    def __init__(self, entries: list[dict], python_executable: str | None = None):
+        self.entries: list[dict] = []
+        for entry in entries:
+            self.entries.append({
+                "label": entry.get("label", "학생 알고리즘"),
+                "path": Path(entry.get("path")),
+                "cwd": Path(entry.get("cwd", Path.cwd())),
+            })
+        self.python_executable = python_executable or sys.executable
+        self.process: subprocess.Popen | None = None
+        self.active_idx: int | None = None
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def poll(self) -> None:
+        if self.process and self.process.poll() is not None:
+            self.process = None
+            self.active_idx = None
+
+    def start(self, idx: int, host: str, port: int) -> tuple[bool, str | None]:
+        if idx < 0 or idx >= len(self.entries):
+            return False, "선택된 알고리즘이 없습니다."
+        entry = self.entries[idx]
+        if not entry["path"].exists():
+            return False, "파일을 찾을 수 없습니다."
+
+        self.stop()
+        cmd = [self.python_executable, str(entry["path"]), "--host", host, "--port", str(port)]
+        try:
+            self.process = subprocess.Popen(cmd, cwd=str(entry["cwd"]))
+            self.active_idx = idx
+            return True, None
+        except Exception as exc:
+            self.process = None
+            self.active_idx = None
+            return False, str(exc)
+
+    def stop(self) -> None:
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            except Exception:
+                pass
+        self.process = None
+        self.active_idx = None
 
 # ----------------- 유틸 -----------------
 def clamp(x,a,b): return max(a, min(b,x))
@@ -711,54 +920,93 @@ def wrap_text_lines(font, text: str, max_width: int):
     if current:
         lines.append(current)
     return lines
-
 def render_map_selection(
-    screen,
-    sw,
-    sh,
+    surface: pygame.Surface,
+    sw: int,
+    sh: int,
     fonts,
     maps_cfg,
     map_cache,
     map_states,
-    selected_idx,
-    hover_idx,
-    card_rects,
-    error_text=None,
-    connection_text=None,
-    ipc_connected=False,
-):
-    font = fonts["regular"]
-    font_large = fonts["large"]
-    font_title = fonts["title"]
+    selected_idx: int,
+    hovered_idx: int | None,
+    error_text: str | None = None,
+    connection_text: str | None = None,
+    ipc_connected: bool = False,
+    focus_mode: str = "maps",
+    agent_entries: list[dict] | None = None,
+    agent_idx: int = 0,
+    agent_active_idx: int | None = None,
+    agent_message: str | None = None,
+    replay_entries: list[dict] | None = None,
+    replay_idx: int = 0,
+    replay_window_start: int = 0,
+) -> tuple[list[pygame.Rect], list[tuple[int, pygame.Rect]], list[tuple[int, pygame.Rect]], int]:
+    agent_entries = agent_entries or []
+    replay_entries = replay_entries or []
 
-    screen.fill((245, 247, 251))
-    title = font_title.render("주행 맵 선택", True, (30, 36, 80))
-    screen.blit(title, ((sw - title.get_width()) // 2, 48))
+    surface.fill((243, 246, 252))
+    main_rect, sidebar_rect = compute_layout(sw, sh)
+    pygame.draw.rect(surface, (248, 250, 253), main_rect)
 
-    subtitle = font.render("연결 전에 사용할 주행 환경을 선택하세요.", True, (80, 90, 110))
-    screen.blit(subtitle, ((sw - subtitle.get_width()) // 2, 110))
+    title_surface = fonts["title"].render("주행 맵 선택", True, (28, 34, 78))
+    surface.blit(title_surface, (main_rect.x + (main_rect.width - title_surface.get_width()) // 2, 52))
+
+    subtitle_surface = fonts["regular"].render("연결 전에 사용할 주행 환경을 선택하세요.", True, (82, 92, 115))
+    surface.blit(subtitle_surface, (main_rect.x + (main_rect.width - subtitle_surface.get_width()) // 2, 112))
 
     if connection_text:
-        status_color = (40, 120, 60) if ipc_connected else (200, 60, 60)
         status_font = fonts["large"]
-        status = status_font.render(connection_text, True, status_color)
-        screen.blit(status, ((sw - status.get_width()) // 2, 150))
+        max_status_width = main_rect.width - MAP_CARD_PADDING * 2
+        status_label = ellipsize_text(status_font, connection_text, max_status_width)
+        status_color = (50, 140, 80) if ipc_connected else (200, 60, 60)
+        status_surface = status_font.render(status_label, True, status_color)
+        surface.blit(status_surface, (main_rect.x + (main_rect.width - status_surface.get_width()) // 2, 160))
 
-    for idx, (cfg, rect) in enumerate(zip(maps_cfg, card_rects)):
+    columns = max(1, min(determine_map_columns(sw), len(maps_cfg) or 1))
+    available_width = max(220, main_rect.width - MAP_CARD_PADDING * 2)
+    card_width = (available_width - (columns - 1) * MAP_CARD_GAP) / max(columns, 1)
+    card_width = max(230, min(card_width, 380))
+    thumbnail_height = card_width / MAP_CARD_ASPECT
+    info_height = 160
+    card_height = int(thumbnail_height + info_height)
+
+    rows = (len(maps_cfg) + columns - 1) // columns if columns else 0
+    total_height = rows * card_height + max(0, rows - 1) * MAP_CARD_GAP
+    grid_top = max(main_rect.y + 200, main_rect.y + (main_rect.height - total_height) // 2)
+
+    total_row_width = columns * card_width + max(0, columns - 1) * MAP_CARD_GAP
+    grid_left = int(main_rect.x + (main_rect.width - total_row_width) // 2)
+
+    card_rects: list[pygame.Rect] = []
+    for idx, cfg in enumerate(maps_cfg):
+        row = idx // columns if columns else 0
+        col = idx % columns if columns else 0
+        x = int(grid_left + col * (card_width + MAP_CARD_GAP))
+        y = int(grid_top + row * (card_height + MAP_CARD_GAP))
+        card_rects.append(pygame.Rect(x, y, int(card_width), int(card_height)))
+
+    for idx, cfg in enumerate(maps_cfg):
+        rect = card_rects[idx]
         selected = idx == selected_idx
-        hovered = hover_idx == idx and not selected
-        base_color = (225, 230, 240)
+        hovered = hovered_idx == idx and not selected
+        base_color = (226, 232, 244)
         if selected:
             base_color = (210, 220, 245)
         elif hovered:
-            base_color = (232, 238, 248)
-        pygame.draw.rect(screen, base_color, rect, border_radius=16)
-        border_color = (65, 110, 220) if selected else (160, 180, 205)
-        border_width = 4 if selected else 2
-        pygame.draw.rect(screen, border_color, rect, border_width, border_radius=16)
+            base_color = (234, 238, 248)
+        pygame.draw.rect(surface, base_color, rect, border_radius=18)
+        border_color = ACCENT_COLOR if selected else (166, 180, 205)
+        border_width = 2 if selected else 1
+        pygame.draw.rect(surface, border_color, rect, border_width, border_radius=18)
 
-        name = font_large.render(cfg["name"], True, (20, 30, 50))
-        screen.blit(name, (rect.x + 20, rect.y + 18))
+        if selected and focus_mode == "maps":
+            overlay = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+            overlay.fill(ACCENT_COLOR + (HIGHLIGHT_ALPHA,))
+            surface.blit(overlay, rect.topleft)
+
+        name_rect = pygame.Rect(rect.x + 20, rect.y + 16, rect.width - 40, 44)
+        draw_wrapped_text(surface, cfg.get("name", "맵"), fonts["large"], (24, 32, 60), name_rect, max_lines=1, ellipsis=True)
 
         state = map_states.setdefault(cfg["key"], {"seed": random.randrange(1 << 30)})
         seed = state["seed"]
@@ -773,51 +1021,239 @@ def render_map_selection(
         except Exception as exc:
             preview_error = f"미리보기 실패: {exc}"
 
-        preview_area = pygame.Rect(rect.x + 20, rect.y + 60, rect.width - 40, 160)
-        pygame.draw.rect(screen, (230, 235, 248), preview_area, border_radius=12)
-        pygame.draw.rect(screen, (150, 170, 210), preview_area, 2, border_radius=12)
+        canvas_rect = pygame.Rect(rect.x + 16, rect.y + 70, rect.width - 32, int(thumbnail_height))
+        pygame.draw.rect(surface, (232, 236, 248), canvas_rect, border_radius=12)
+        pygame.draw.rect(surface, (152, 170, 210), canvas_rect, 1, border_radius=12)
         if preview:
-            scaled = pygame.transform.smoothscale(preview, (preview_area.width - 12, preview_area.height - 12))
-            screen.blit(scaled, (preview_area.x + 6, preview_area.y + 6))
+            scaled = pygame.transform.smoothscale(preview, (canvas_rect.width - 12, canvas_rect.height - 12))
+            surface.blit(scaled, (canvas_rect.x + 6, canvas_rect.y + 6))
         elif preview_error:
-            msg = font.render(preview_error, True, (170, 50, 50))
-            screen.blit(msg, (preview_area.x + 12, preview_area.y + preview_area.height // 2 - msg.get_height() // 2))
+            draw_wrapped_text(
+                surface,
+                preview_error,
+                fonts["regular"],
+                (180, 70, 70),
+                canvas_rect.inflate(-12, -12),
+                align="center",
+                line_height=1.25,
+                max_lines=3,
+            )
 
-        summary_lines = wrap_text_lines(font, cfg.get("summary", ""), rect.width - 40)
-
-        y = preview_area.bottom + 14
-        for line in summary_lines:
-            surf = font.render(line, True, (55, 65, 90))
-            screen.blit(surf, (rect.x + 20, y))
-            y += 24
+        summary_rect = pygame.Rect(rect.x + 20, canvas_rect.bottom + 16, rect.width - 40, 72)
+        draw_wrapped_text(
+            surface,
+            cfg.get("summary", ""),
+            fonts["regular"],
+            (58, 68, 92),
+            summary_rect,
+            align="center",
+            line_height=1.28,
+            max_lines=3,
+        )
 
         if bundle:
             meta = bundle.get("meta", {})
-            stats_text = f"전체 슬롯 {meta.get('slots_total', '?')}개 / 점유 {meta.get('occupied_total', '?')}개"
-            stats = font.render(stats_text, True, (100, 110, 140))
-            screen.blit(stats, (rect.x + 20, rect.y + rect.height - 60))
+            stats_text = f"전체 슬롯 {meta.get('slots_total', '?')}개 · 점유 {meta.get('occupied_total', '?')}개"
+            stats_rect = pygame.Rect(rect.x + 20, rect.bottom - 56, rect.width - 40, 24)
+            draw_wrapped_text(surface, stats_text, fonts["regular"], (100, 110, 140), stats_rect, align="center", max_lines=1)
 
-        footer = font.render(f"{idx+1}/{len(maps_cfg)}", True, (120, 130, 150))
-        screen.blit(footer, (rect.x + rect.width - footer.get_width() - 12, rect.y + rect.height - 30))
+        footer_surface = fonts["regular"].render(f"{idx + 1}/{len(maps_cfg)}", True, (120, 130, 150))
+        surface.blit(footer_surface, (rect.right - footer_surface.get_width() - 14, rect.bottom - footer_surface.get_height() - 10))
 
-        if selected:
-            tag = font.render("선택됨", True, (255, 255, 255))
-            tag_rect = pygame.Rect(rect.x + 20, rect.y + rect.height - 38, tag.get_width() + 20, 26)
-            pygame.draw.rect(screen, (65, 110, 220), tag_rect, border_radius=12)
-            screen.blit(tag, (tag_rect.x + 10, tag_rect.y + 4))
+        if selected and focus_mode == "maps":
+            tag_surface = fonts["regular"].render("선택됨", True, (255, 255, 255))
+            tag_rect = pygame.Rect(rect.x + 18, rect.y + rect.height - 42, tag_surface.get_width() + 24, 26)
+            pygame.draw.rect(surface, ACCENT_COLOR, tag_rect, border_radius=12)
+            surface.blit(tag_surface, (tag_rect.x + 12, tag_rect.y + 4))
 
-    instruction = font.render("← → 또는 A/D: 맵 변경  ·  Enter/Space: 선택  ·  ESC/Q: 종료", True, (70, 80, 95))
-    screen.blit(instruction, ((sw - instruction.get_width()) // 2, sh - 120))
+    if not maps_cfg:
+        placeholder = fonts["regular"].render("등록된 맵이 없습니다.", True, (110, 120, 140))
+        surface.blit(placeholder, (main_rect.x + (main_rect.width - placeholder.get_width()) // 2, main_rect.y + main_rect.height // 2))
+
+    instructions = "← → 또는 A/D: 맵 변경  ·  Enter/Space: 선택  ·  TAB: 영역 이동  ·  ESC/Q: 종료"
+    instr_surface = fonts["regular"].render(instructions, True, (72, 82, 95))
+    surface.blit(instr_surface, (main_rect.x + (main_rect.width - instr_surface.get_width()) // 2, main_rect.bottom - 48))
 
     if error_text:
-        err = font.render(error_text, True, (190, 40, 40))
-        screen.blit(err, ((sw - err.get_width()) // 2, sh - 60))
+        err_surface = fonts["regular"].render(error_text, True, (192, 60, 60))
+        surface.blit(err_surface, (main_rect.x + (main_rect.width - err_surface.get_width()) // 2, main_rect.bottom - 80))
+
+    agent_rects: list[tuple[int, pygame.Rect]] = []
+    replay_rects: list[tuple[int, pygame.Rect]] = []
+    if sidebar_rect.width > 0:
+        agent_rects, replay_rects, replay_window_start = render_selection_side_panel(
+            surface,
+            fonts,
+            sidebar_rect,
+            focus_mode,
+            agent_entries,
+            agent_idx,
+            agent_active_idx,
+            agent_message,
+            replay_entries,
+            replay_idx,
+            replay_window_start,
+        )
+
+    return card_rects, agent_rects, replay_rects, replay_window_start
+
+
+def render_selection_side_panel(
+    surface: pygame.Surface,
+    fonts,
+    sidebar_rect: pygame.Rect,
+    focus_mode: str,
+    agent_entries: list[dict],
+    agent_idx: int,
+    agent_active_idx: int | None,
+    agent_message: str | None,
+    replay_entries: list[dict],
+    replay_idx: int,
+    replay_window_start: int,
+) -> tuple[list[tuple[int, pygame.Rect]], list[tuple[int, pygame.Rect]], int]:
+    agent_rects: list[tuple[int, pygame.Rect]] = []
+    replay_rects: list[tuple[int, pygame.Rect]] = []
+
+    if sidebar_rect.width <= 0:
+        return agent_rects, replay_rects, replay_window_start
+
+    font = fonts["regular"]
+    font_large = fonts["large"]
+
+    pygame.draw.rect(surface, (234, 237, 246), sidebar_rect)
+    pygame.draw.line(surface, (186, 194, 208), (sidebar_rect.x, sidebar_rect.y), (sidebar_rect.x, sidebar_rect.bottom), 2)
+
+    section_x = sidebar_rect.x + 20
+    section_width = sidebar_rect.width - 40
+    y = sidebar_rect.y + 36
+
+    def draw_header(text: str, top: int) -> int:
+        header = font_large.render(text, True, (45, 55, 95))
+        surface.blit(header, (section_x, top))
+        divider_y = top + header.get_height() + 6
+        pygame.draw.line(surface, (192, 200, 214), (section_x, divider_y), (section_x + section_width, divider_y), 1)
+        return divider_y + 12
+
+    y = draw_header("학생 알고리즘", y)
+    agent_item_height = 66
+    if not agent_entries:
+        empty_rect = pygame.Rect(section_x, y, section_width, 70)
+        draw_wrapped_text(surface, "감지된 알고리즘이 없습니다.", font, (145, 155, 175), empty_rect, max_lines=3)
+        y = empty_rect.bottom + 16
+    else:
+        for idx, entry in enumerate(agent_entries):
+            item_rect = pygame.Rect(section_x, y, section_width, agent_item_height)
+            running = agent_active_idx == idx and entry.get("running")
+            available = entry.get("available", True) and entry.get("exists", True)
+            focused = focus_mode == "agents" and idx == agent_idx
+
+            base_color = (239, 242, 251)
+            if running:
+                base_color = (206, 243, 214)
+            elif not available:
+                base_color = (245, 223, 223)
+            if focused:
+                base_color = (210, 222, 247)
+            pygame.draw.rect(surface, base_color, item_rect, border_radius=14)
+            border_color = ACCENT_COLOR if focused else (178, 188, 204)
+            pygame.draw.rect(surface, border_color, item_rect, 2, border_radius=14)
+
+            status_color = (44, 136, 72) if running else ((185, 68, 68) if not available else (110, 120, 150))
+            status_text = "실행 중" if running else ("파일 없음" if not available else "대기")
+
+            pygame.draw.circle(surface, status_color, (item_rect.x + 18, item_rect.y + item_rect.height // 2), 8)
+            label_rect = pygame.Rect(item_rect.x + 36, item_rect.y + 10, item_rect.width - 44, 24)
+            draw_wrapped_text(surface, entry.get("label", "학생 알고리즘"), font, (35, 45, 82), label_rect, max_lines=1, ellipsis=True)
+            status_rect = pygame.Rect(item_rect.x + 36, item_rect.y + 36, item_rect.width - 44, 22)
+            draw_wrapped_text(surface, status_text, font, status_color, status_rect, max_lines=1, ellipsis=True)
+
+            agent_rects.append((idx, item_rect))
+            y += agent_item_height + 12
+
+    if agent_message:
+        message_rect = pygame.Rect(section_x, y, section_width, 70)
+        draw_wrapped_text(surface, agent_message, font, (125, 70, 70), message_rect, max_lines=3)
+        y = message_rect.bottom + 18
+
+    y = max(y, sidebar_rect.y + int(sidebar_rect.height * 0.48))
+    y = draw_header("리플레이", y)
+
+    if not replay_entries:
+        empty_rect = pygame.Rect(section_x, y, section_width, 80)
+        draw_wrapped_text(surface, "저장된 리플레이가 없습니다.", font, (145, 155, 175), empty_rect, max_lines=3)
+        y = empty_rect.bottom + 18
+    else:
+        max_visible = 7 if sidebar_rect.height > 880 else 5
+        total = len(replay_entries)
+        replay_window_start = max(0, min(replay_window_start, max(0, total - max_visible)))
+        if replay_idx < replay_window_start:
+            replay_window_start = replay_idx
+        elif replay_idx >= replay_window_start + max_visible:
+            replay_window_start = replay_idx - max_visible + 1
+        visible_entries = replay_entries[replay_window_start: replay_window_start + max_visible]
+        replay_item_height = 74
+
+        for offset, entry in enumerate(visible_entries):
+            idx = replay_window_start + offset
+            item_rect = pygame.Rect(section_x, y, section_width, replay_item_height)
+            focused = focus_mode == "replays" and idx == replay_idx
+            base_color = (240, 243, 250)
+            if focused:
+                base_color = (212, 224, 244)
+            pygame.draw.rect(surface, base_color, item_rect, border_radius=14)
+            border_color = ACCENT_COLOR if focused else (178, 188, 204)
+            pygame.draw.rect(surface, border_color, item_rect, 2, border_radius=14)
+
+            meta = entry.get("meta", {}) if isinstance(entry.get("meta"), dict) else {}
+            timestamp = meta.get("timestamp", "")
+            if timestamp:
+                try:
+                    dt = datetime.fromisoformat(timestamp)
+                    timestamp = dt.strftime("%m-%d %H:%M") if sidebar_rect.width < 420 else dt.strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    pass
+            map_name = meta.get("map_name") or meta.get("map_key") or "맵"
+            score = meta.get("score")
+            result = meta.get("result", "")
+            status_color = (190, 60, 60) if result == "collision" else (102, 112, 142)
+
+            headline_rect = pygame.Rect(item_rect.x + 16, item_rect.y + 10, item_rect.width - 32, 26)
+            headline = f"{timestamp} · {map_name}" if timestamp else map_name
+            draw_wrapped_text(surface, headline, font, (42, 52, 88), headline_rect, max_lines=1, ellipsis=True)
+
+            details_rect = pygame.Rect(item_rect.x + 16, item_rect.y + 38, item_rect.width - 32, 24)
+            detail_parts = []
+            if isinstance(score, (int, float)):
+                detail_parts.append(f"{score:.1f}점")
+            if result:
+                detail_parts.append(result)
+            draw_wrapped_text(surface, " · ".join(detail_parts), font, status_color, details_rect, max_lines=1, ellipsis=True)
+
+            if entry.get("error"):
+                error_rect = pygame.Rect(item_rect.x + 16, item_rect.bottom - 24, item_rect.width - 32, 18)
+                draw_wrapped_text(surface, "불러오기 실패", font, (190, 70, 70), error_rect, max_lines=1, ellipsis=True)
+
+            replay_rects.append((idx, item_rect))
+            y += replay_item_height + 12
+
+    instructions = [
+        "Enter: 실행 / 선택",
+        "Backspace: 알고리즘 종료",
+        "R: 리플레이 새로고침",
+        "TAB: 영역 이동",
+    ]
+    instr_y = sidebar_rect.bottom - len(instructions) * 24 - 28
+    for line in instructions:
+        instr_surface = font.render(line, True, (96, 105, 135))
+        surface.blit(instr_surface, (section_x, instr_y))
+        instr_y += 24
+
+    return agent_rects, replay_rects, replay_window_start
+
 
 def map_selection_loop(
-    screen,
+    screen_state: dict,
     clock,
-    sw,
-    sh,
     fonts,
     maps_cfg,
     map_cache,
@@ -827,62 +1263,203 @@ def map_selection_loop(
     port=55556,
     initial_idx=0,
     error_text=None,
+    agent_manager: AgentManager | None = None,
+    replay_loader=None,
 ):
     selected_idx = min(initial_idx, max(len(maps_cfg) - 1, 0))
+    focus_mode = "maps"
+    agent_idx = 0
+    replay_idx = 0
     hovered_idx = None
+    agent_message: str | None = None
+    agent_message_until = 0
+    last_replay_click = 0
+    replay_window_start = 0
+    prev_agent_active: int | None = None
+
+    replay_entries = replay_loader() if replay_loader else []
+    agent_rects: list[tuple[int, pygame.Rect]] = []
+    replay_rects: list[tuple[int, pygame.Rect]] = []
+    card_rects: list[pygame.Rect] = []
+
     running = True
     while running:
+        screen = screen_state["surface"]
+        sw, sh = screen_state["size"]
+
         if ipc:
             try:
                 ipc.poll_accept()
             except Exception:
                 pass
 
-        card_rects = compute_map_card_rects(sw, sh, len(maps_cfg))
+        now = pygame.time.get_ticks()
+        if agent_message and now > agent_message_until:
+            agent_message = None
+
+        agent_entries_info: list[dict] = []
+        if agent_manager:
+            agent_manager.poll()
+            for idx, entry in enumerate(agent_manager.entries):
+                exists = entry["path"].exists()
+                running_proc = agent_manager.is_running() and agent_manager.active_idx == idx
+                agent_entries_info.append({
+                    "label": entry.get("label", "학생 알고리즘"),
+                    "exists": exists,
+                    "available": exists,
+                    "running": running_proc,
+                })
+        current_agent_active = agent_manager.active_idx if agent_manager and agent_manager.is_running() else None
+        if prev_agent_active is not None and current_agent_active is None and agent_message is None:
+            agent_message = "학생 알고리즘이 종료되었습니다."
+            agent_message_until = pygame.time.get_ticks() + 2500
+        prev_agent_active = current_agent_active
+
+        if agent_entries_info:
+            agent_idx = max(0, min(agent_idx, len(agent_entries_info) - 1))
+        else:
+            agent_idx = 0
+
+        if replay_entries:
+            replay_idx = max(0, min(replay_idx, len(replay_entries) - 1))
+        else:
+            replay_idx = 0
+
+        focus_sections = ["maps"]
+        if agent_entries_info:
+            focus_sections.append("agents")
+        focus_sections.append("replays")
+        if focus_mode not in focus_sections:
+            focus_mode = focus_sections[0]
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return None
+            if event.type == pygame.VIDEORESIZE:
+                new_size = enforce_min_window_size(event.w, event.h)
+                screen_state["surface"] = pygame.display.set_mode(new_size, pygame.RESIZABLE)
+                screen_state["size"] = new_size
+                update_viewport(*new_size)
+                continue
             if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_TAB:
+                    current_idx = focus_sections.index(focus_mode)
+                    if event.mod & pygame.KMOD_SHIFT:
+                        current_idx = (current_idx - 1) % len(focus_sections)
+                    else:
+                        current_idx = (current_idx + 1) % len(focus_sections)
+                    focus_mode = focus_sections[current_idx]
+                    continue
+
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     return None
-                if event.key in (pygame.K_RIGHT, pygame.K_d):
-                    if maps_cfg:
+
+                if focus_mode == "maps":
+                    if event.key in (pygame.K_RIGHT, pygame.K_d) and maps_cfg:
                         selected_idx = (selected_idx + 1) % len(maps_cfg)
-                if event.key in (pygame.K_LEFT, pygame.K_a):
-                    if maps_cfg:
+                    elif event.key in (pygame.K_LEFT, pygame.K_a) and maps_cfg:
                         selected_idx = (selected_idx - 1) % len(maps_cfg)
-                if event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    if maps_cfg:
-                        return selected_idx
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and maps_cfg:
+                    elif event.key in (pygame.K_RETURN, pygame.K_SPACE) and maps_cfg:
+                        return ("map", selected_idx)
+                    continue
+
+                if focus_mode == "agents":
+                    if event.key in (pygame.K_UP, pygame.K_w) and agent_entries_info:
+                        agent_idx = (agent_idx - 1) % len(agent_entries_info)
+                        continue
+                    if event.key in (pygame.K_DOWN, pygame.K_s) and agent_entries_info:
+                        agent_idx = (agent_idx + 1) % len(agent_entries_info)
+                        continue
+                    if event.key in (pygame.K_RETURN, pygame.K_SPACE) and agent_manager and agent_entries_info:
+                        if agent_manager.is_running() and agent_manager.active_idx == agent_idx:
+                            agent_manager.stop()
+                            agent_message = "학생 알고리즘을 종료했습니다."
+                            agent_message_until = pygame.time.get_ticks() + 2500
+                        else:
+                            success, err = agent_manager.start(agent_idx, host, port)
+                            if success:
+                                agent_message = "학생 알고리즘을 실행했습니다."
+                            else:
+                                agent_message = f"실행 실패: {err}"
+                            agent_message_until = pygame.time.get_ticks() + 3500
+                        continue
+                    if event.key in (pygame.K_BACKSPACE, pygame.K_DELETE, pygame.K_x):
+                        if agent_manager and agent_manager.is_running():
+                            agent_manager.stop()
+                            agent_message = "학생 알고리즘을 종료했습니다."
+                        else:
+                            agent_message = "실행 중인 알고리즘이 없습니다."
+                        agent_message_until = pygame.time.get_ticks() + 2500
+                        continue
+                    continue
+
+                if focus_mode == "replays":
+                    if event.key in (pygame.K_UP, pygame.K_w) and replay_entries:
+                        replay_idx = (replay_idx - 1) % len(replay_entries)
+                        continue
+                    if event.key in (pygame.K_DOWN, pygame.K_s) and replay_entries:
+                        replay_idx = (replay_idx + 1) % len(replay_entries)
+                        continue
+                    if event.key in (pygame.K_RETURN, pygame.K_SPACE) and replay_entries:
+                        return ("replay", str(replay_entries[replay_idx]["path"]))
+                    if event.key in (pygame.K_r, pygame.K_F5) and replay_loader:
+                        replay_entries = replay_loader() or []
+                        replay_idx = min(replay_idx, len(replay_entries) - 1) if replay_entries else 0
+                        replay_window_start = 0
+                    continue
+
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                handled = False
+                for idx, rect in agent_rects:
+                    if rect.collidepoint(event.pos):
+                        focus_mode = "agents"
+                        agent_idx = idx
+                        handled = True
+                        break
+                if handled:
+                    continue
+
+                for idx, rect in replay_rects:
+                    if rect.collidepoint(event.pos):
+                        focus_mode = "replays"
+                        replay_idx = idx
+                        ticks = pygame.time.get_ticks()
+                        if ticks - last_replay_click < 350 and replay_entries:
+                            return ("replay", str(replay_entries[replay_idx]["path"]))
+                        last_replay_click = ticks
+                        handled = True
+                        break
+                if handled:
+                    continue
+
                 for idx, rect in enumerate(card_rects):
                     if rect.collidepoint(event.pos):
+                        focus_mode = "maps"
                         if idx == selected_idx:
-                            return selected_idx
+                            return ("map", selected_idx)
                         selected_idx = idx
                         break
 
-        mouse_pos = pygame.mouse.get_pos()
-        hovered_idx = None
-        for idx, rect in enumerate(card_rects):
-            if rect.collidepoint(mouse_pos):
-                hovered_idx = idx
-                break
+            if event.type == pygame.MOUSEWHEEL and replay_entries:
+                if event.y > 0:
+                    replay_idx = max(0, replay_idx - 1)
+                elif event.y < 0:
+                    replay_idx = min(len(replay_entries) - 1, replay_idx + 1)
 
-        if ipc:
-            if ipc.is_connected:
-                peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{host}:{port}"
-                connection_text = f"학생 알고리즘 연결됨 — {peer}"
-                ipc_connected = True
-            else:
-                connection_text = f"학생 알고리즘 연결 대기 중 — {host}:{port}"
-                ipc_connected = False
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 4 and replay_entries:
+                replay_idx = max(0, replay_idx - 1)
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 5 and replay_entries:
+                replay_idx = min(len(replay_entries) - 1, replay_idx + 1)
+
+        if ipc and ipc.is_connected:
+            peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{host}:{port}"
+            connection_text = f"학생 알고리즘 연결됨 — {peer}"
+            ipc_connected = True
         else:
-            connection_text = None
+            connection_text = f"학생 알고리즘 연결 대기 중 — {host}:{port}" if ipc else None
             ipc_connected = False
 
-        render_map_selection(
+        card_rects, agent_rects, replay_rects, replay_window_start = render_map_selection(
             screen,
             sw,
             sh,
@@ -892,11 +1469,26 @@ def map_selection_loop(
             map_states,
             selected_idx,
             hovered_idx,
-            card_rects,
             error_text=error_text,
             connection_text=connection_text,
             ipc_connected=ipc_connected,
+            focus_mode=focus_mode,
+            agent_entries=agent_entries_info,
+            agent_idx=agent_idx,
+            agent_active_idx=current_agent_active,
+            agent_message=agent_message,
+            replay_entries=replay_entries,
+            replay_idx=replay_idx,
+            replay_window_start=replay_window_start,
         )
+
+        mouse_pos = pygame.mouse.get_pos()
+        hovered_idx = None
+        for idx, rect in enumerate(card_rects):
+            if rect.collidepoint(mouse_pos):
+                hovered_idx = idx
+                break
+
         pygame.display.flip()
         clock.tick(60)
 
@@ -1183,10 +1775,19 @@ def main():
 
     # 1) pygame
     pygame.init()
-    pygame.event.set_allowed([pygame.QUIT, pygame.KEYDOWN, pygame.KEYUP])
-    sw, sh = 1100, 700
-    screen = pygame.display.set_mode((sw, sh))
+    pygame.event.set_allowed([
+        pygame.QUIT,
+        pygame.KEYDOWN,
+        pygame.KEYUP,
+        pygame.MOUSEBUTTONDOWN,
+        pygame.MOUSEBUTTONUP,
+        pygame.MOUSEWHEEL,
+        pygame.VIDEORESIZE,
+    ])
+    screen = pygame.display.set_mode(BASE_WINDOW_SIZE, pygame.RESIZABLE)
     pygame.display.set_caption("Self-Parking — Layered Map from MATLAB (IPC)")
+    screen_state = {"surface": screen, "size": BASE_WINDOW_SIZE}
+    sw, sh = screen_state["size"]
     clock = pygame.time.Clock()
     font = load_font_with_fallback(18)
     font_large = load_font_with_fallback(28, bold=True)
@@ -1194,11 +1795,7 @@ def main():
     fonts = {"regular": font, "large": font_large, "title": font_title}
 
     # Viewport margins so HUD stays outside of the lot rendering area.
-    hud_h = 64
-    margin = 24
-    global vp_ox, vp_oy, vp_w, vp_h
-    vp_ox, vp_oy = margin, hud_h
-    vp_w, vp_h = sw - 2 * margin, sh - hud_h - margin
+    update_viewport(*screen_state["size"])
 
     if args.mode == "replay":
         run_replay_mode(screen, clock, sw, sh, fonts, args.replay, replay_meta, replay_frames)
@@ -1207,6 +1804,9 @@ def main():
 
     # ----- 재시작 가능한 라운드 루프 -----
     ipc = IPCController(args.host, args.port) if args.mode == "ipc" else None
+    base_dir = Path(__file__).resolve().parent
+    agent_manager = AgentManager(discover_agent_entries(base_dir)) if args.mode == "ipc" else None
+    replay_loader = load_replay_catalog
     map_cache = {}
     map_states = {}
     map_seeds_dirty = True
@@ -1233,10 +1833,8 @@ def main():
                 current_target_idx = None
                 active_map_cfg = None
             choice = map_selection_loop(
-                screen,
+                screen_state,
                 clock,
-                sw,
-                sh,
                 fonts,
                 AVAILABLE_MAPS,
                 map_cache,
@@ -1246,10 +1844,31 @@ def main():
                 port=args.port,
                 initial_idx=selected_map_idx,
                 error_text=selection_error,
+                agent_manager=agent_manager,
+                replay_loader=replay_loader,
             )
             if choice is None:
                 break
-            selected_map_idx = choice
+            choice_kind, payload = choice
+            if choice_kind == "replay":
+                try:
+                    replay_meta, replay_frames = load_replay_file(payload)
+                except Exception as exc:
+                    selection_error = f"리플레이 로드 실패: {exc}"
+                    continue
+            
+                screen = screen_state["surface"]
+                sw, sh = screen_state["size"]
+                update_viewport(sw, sh)
+                run_replay_mode(screen, clock, sw, sh, fonts, payload, replay_meta, replay_frames)
+                selection_error = None
+                map_seeds_dirty = True
+                continue
+            if choice_kind != "map":
+                selection_error = "알 수 없는 선택 항목입니다."
+                continue
+
+            selected_map_idx = payload
             selection_error = None
             selected_cfg = AVAILABLE_MAPS[selected_map_idx]
             selected_seed = map_states[selected_cfg["key"]]["seed"]
@@ -1268,6 +1887,9 @@ def main():
             current_target_idx = bundle.get("target_idx")
             map_states[selected_cfg["key"]]["target_idx"] = current_target_idx
             active_map_cfg = selected_cfg
+            screen = screen_state["surface"]
+            sw, sh = screen_state["size"]
+            update_viewport(sw, sh)
             xmin, xmax, ymin, ymax = M.extent
             world = (xmin, xmax, ymin, ymax)
             H, W = M.C.shape
@@ -1632,7 +2254,7 @@ def main():
 
             pygame.display.flip()
             clock.tick(int(1.0 / P.dt))
-            if not waiting_for_ipc:
+            if not waiting_for_ipc and not paused:
                 t += P.dt
                 if t >= P.timeout:
                     why = "timeout"
@@ -1784,6 +2406,8 @@ def main():
 
     if ipc:
         ipc.shutdown()
+    if agent_manager:
+        agent_manager.stop()
 
     pygame.quit()
 
