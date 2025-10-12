@@ -9,6 +9,7 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "0")  # macOS IME 노이즈 억제
 
 import argparse, errno, json, math, random, socket, copy
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
 
@@ -41,6 +42,7 @@ vp_ox = vp_oy = vp_w = vp_h = None
 
 BASE_MAP_CACHE = {}
 RECENT_RESULTS = deque(maxlen=3)
+REPLAY_DIR = "replays"
 
 MARKER_COLORS = {
     "boundary": (200, 60, 60),
@@ -506,6 +508,52 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     })
     return score, details
 
+def _slugify(text: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in text)
+    slug = slug.strip("_")
+    return slug or "session"
+
+def save_replay_log(frames: list[dict], meta: dict) -> str | None:
+    """IPC 통신 로그를 리플레이 파일로 저장한다."""
+    if not frames:
+        return None
+    try:
+        os.makedirs(REPLAY_DIR, exist_ok=True)
+    except Exception as exc:
+        print(f"[replay] 디렉터리 생성 실패: {exc}")
+        return None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    map_label = _slugify(meta.get("map_key", meta.get("map_name", "session")))
+    filename = f"{timestamp}_{map_label}.json"
+    path = os.path.join(REPLAY_DIR, filename)
+    payload = {
+        "meta": meta,
+        "frames": frames,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
+        print(f"[replay] 저장 완료: {path}")
+        return path
+    except Exception as exc:
+        print(f"[replay] 저장 실패: {exc}")
+        return None
+
+def load_replay_file(path: str) -> tuple[dict, list[dict]]:
+    """리플레이 JSON 파일을 읽어 메타와 프레임 리스트를 반환한다."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"리플레이 파일을 찾을 수 없습니다: {path}")
+    with open(path, "r", encoding="utf-8") as fp:
+        try:
+            data = json.load(fp)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"리플레이 파일이 손상되었습니다: {exc}") from exc
+    meta = data.get("meta", {})
+    frames = data.get("frames", [])
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("리플레이 파일에 프레임 데이터가 없습니다.")
+    return meta, frames
+
 def build_map_payload(M: MapAssets) -> dict:
     return {
         "extent": [float(x) for x in M.extent],
@@ -958,16 +1006,180 @@ class IPCController:
             "gear": str(msg.get("gear", "D")),
         }
 
+def run_replay_mode(screen, clock, sw, sh, fonts, replay_path: str, meta: dict, frames: list[dict]):
+    """저장된 리플레이 파일을 재생한다."""
+    map_key = meta.get("map_key")
+    map_cfg = next((cfg for cfg in AVAILABLE_MAPS if cfg.get("key") == map_key), AVAILABLE_MAPS[0])
+    map_seed = meta.get("map_seed")
+    bundle = ensure_map_loaded(map_cfg, {}, seed=map_seed)
+    M = bundle["assets"]
+    world = M.extent
+
+    target_idx = meta.get("target_idx")
+    target_slot = None
+    if target_idx is not None and isinstance(target_idx, int) and 0 <= target_idx < len(M.slots):
+        target_slot = tuple(M.slots[target_idx].tolist())
+    if target_slot is None:
+        first_obs = frames[0].get("obs", {}) if frames else {}
+        slot_payload = first_obs.get("target_slot")
+        if slot_payload and len(slot_payload) == 4:
+            target_slot = tuple(float(v) for v in slot_payload)
+    if target_slot is None and len(M.slots) > 0:
+        fallback_idx = bundle.get("target_idx", 0)
+        fallback_idx = fallback_idx if 0 <= fallback_idx < len(M.slots) else 0
+        target_slot = tuple(M.slots[fallback_idx].tolist())
+
+    P = Params()
+    state = State()
+    delta = 0.0
+    traj = []
+
+    total_frames = len(frames)
+    frame_idx = 0
+    playing = True
+    replay_done = False
+    current_cmd = {}
+    current_time = 0.0
+    reason = meta.get("result", "replay")
+    score_value = meta.get("score", 0.0)
+    stats_meta = meta.get("stats", {}) if isinstance(meta.get("stats"), dict) else {}
+    stage_label = meta.get("stage_label") or get_stage_profile(map_cfg)[1].get("label", "")
+
+    def reset_playback():
+        nonlocal frame_idx, playing, replay_done, delta, current_cmd, current_time, traj
+        frame_idx = 0
+        playing = True
+        replay_done = False
+        delta = 0.0
+        current_cmd = {}
+        current_time = 0.0
+        traj.clear()
+
+    def apply_frame(idx: int):
+        nonlocal delta, current_cmd, current_time
+        if idx < 0 or idx >= total_frames:
+            return
+        frame = frames[idx]
+        obs = frame.get("obs", {})
+        obs_state = obs.get("state", {})
+        state.x = float(obs_state.get("x", state.x))
+        state.y = float(obs_state.get("y", state.y))
+        state.yaw = float(obs_state.get("yaw", state.yaw))
+        state.v = float(obs_state.get("v", state.v))
+        current_time = float(obs.get("t", current_time))
+        traj.append((state.x, state.y))
+        if len(traj) > 2000:
+            traj.pop(0)
+        current_cmd = frame.get("cmd") or {}
+        delta = float(current_cmd.get("steer", delta))
+
+    reset_playback()
+
+    reason_map = {
+        "success": "성공",
+        "collision": "충돌",
+        "timeout": "시간초과",
+        "quit": "종료",
+        "replay": "리플레이",
+    }
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    playing = not playing
+                elif event.key == pygame.K_r:
+                    reset_playback()
+
+        if playing and frame_idx < total_frames:
+            apply_frame(frame_idx)
+            frame_idx += 1
+            if frame_idx >= total_frames:
+                playing = False
+                replay_done = True
+
+        clock.tick(int(1.0 / P.dt))
+
+        screen.fill((245, 245, 245))
+        pygame.draw.rect(screen, (0, 0, 0), pygame.Rect(vp_ox, vp_oy, vp_w, vp_h), 3)
+        draw_rect(screen, M.border, (0, 0, 0), world, sw, sh, width=4)
+        draw_walls_rects(screen, world, sw, sh, M.walls_rects)
+        for x1, y1, x2, y2 in M.lines:
+            p1 = world_to_screen(x1, y1, world, sw, sh)
+            p2 = world_to_screen(x2, y2, world, sw, sh)
+            pygame.draw.line(screen, (0, 0, 0), p1, p2, 3)
+        for i, rect in enumerate(M.slots):
+            if M.occupied_idx[i]:
+                draw_rect(screen, tuple(rect), (0, 0, 0), world, sw, sh, width=0)
+        for rect in M.slots:
+            draw_rect(screen, tuple(rect), (0, 0, 0), world, sw, sh, width=2)
+        if target_slot:
+            draw_rect(screen, target_slot, (180, 255, 180), world, sw, sh, width=0)
+            draw_rect(screen, target_slot, (50, 140, 50), world, sw, sh, width=2)
+        if len(traj) >= 2:
+            pts = [world_to_screen(x, y, world, sw, sh) for (x, y) in traj]
+            pygame.draw.lines(screen, (50, 50, 200), False, pts, 2)
+        draw_car(screen, state, delta, P, world, sw, sh)
+
+        hud1 = f"t={current_time:6.2f}s  frame={min(frame_idx, total_frames)}/{total_frames}"
+        steer_deg = math.degrees(delta)
+        hud2 = f"steer={steer_deg:6.2f}°  accel={float(current_cmd.get('accel', 0.0))*100:5.1f}%  brake={float(current_cmd.get('brake', 0.0))*100:5.1f}%  gear={current_cmd.get('gear', 'D')}"
+        play_state = "재생" if playing else "일시정지"
+        hud3 = f"맵: {map_cfg['name']}  |  모드: Replay ({play_state})"
+        hint = "SPACE: 재생/일시정지  ·  R: 처음부터  ·  ESC/Q: 종료"
+        screen.blit(fonts["regular"].render(hud1, True, (0, 0, 0)), (12, 8))
+        screen.blit(fonts["regular"].render(hud2, True, (0, 0, 0)), (12, 26))
+        hud3_img = fonts["regular"].render(hud3, True, (0, 0, 0))
+        screen.blit(hud3_img, (12, 44))
+        hint_img = fonts["regular"].render(hint, True, (70, 70, 70))
+        screen.blit(hint_img, (sw - hint_img.get_width() - 16, 44))
+
+        if replay_done:
+            elapsed = stats_meta.get("elapsed", current_time)
+            distance = stats_meta.get("distance", 0.0)
+            gear_sw = stats_meta.get("gear_switches", 0)
+            avg_speed = stats_meta.get("avg_speed", 0.0)
+            reason_text = reason_map.get(reason, reason)
+            info_lines = [
+                f"Score: {score_value:.1f}",
+                f"Result: {reason_text}",
+                f"Stage: {stage_label}",
+                f"Elapsed: {elapsed:.1f} s",
+                f"Distance: {distance:.1f} m",
+                f"Gear switches: {gear_sw}",
+                f"Avg speed: {avg_speed:.2f} m/s",
+                f"Frames: {total_frames}",
+                f"Replay file: {os.path.basename(replay_path)}",
+            ]
+            draw_overlay(screen, "REPLAY", info_lines, fonts["regular"], sw, sh)
+
+        pygame.display.flip()
+
 # ----------------- 메인 -----------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["ipc","wasd"], default="ipc")
+    ap.add_argument("--mode", choices=["ipc","wasd","replay"], default="ipc")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=55556)
+    ap.add_argument("--replay", help="저장된 리플레이 파일(JSON)을 재생합니다.")
     return ap.parse_args()
 
 def main():
     args = parse_args()
+    replay_meta = None
+    replay_frames = None
+    if args.replay:
+        args.mode = "replay"
+        try:
+            replay_meta, replay_frames = load_replay_file(args.replay)
+        except Exception as exc:
+            print(f"[replay] 로드 실패: {exc}")
+            return
 
     # 1) pygame
     pygame.init()
@@ -987,6 +1199,11 @@ def main():
     global vp_ox, vp_oy, vp_w, vp_h
     vp_ox, vp_oy = margin, hud_h
     vp_w, vp_h = sw - 2 * margin, sh - hud_h - margin
+
+    if args.mode == "replay":
+        run_replay_mode(screen, clock, sw, sh, fonts, args.replay, replay_meta, replay_frames)
+        pygame.quit()
+        return
 
     # ----- 재시작 가능한 라운드 루프 -----
     ipc = IPCController(args.host, args.port) if args.mode == "ipc" else None
@@ -1099,6 +1316,7 @@ def main():
         round_stats = RoundStats()
         round_stats.prev_gear = u.gear
         round_stats.min_abs_steer = abs(delta)
+        replay_frames = []
 
         # ---- 메인 주행 루프 ----
         while why == "running":
@@ -1196,6 +1414,7 @@ def main():
                                 "steerRate": P.steerRate,
                             },
                         }
+                        replay_entry = {"t": t, "obs": obs, "cmd": None}
                         try:
                             ipc.send_obs(obs)
                             cmd = ipc.recv_cmd()
@@ -1203,7 +1422,10 @@ def main():
                             u.accel = clamp(float(cmd.get("accel", 0.0)), 0.0, 1.0)
                             u.brake = clamp(float(cmd.get("brake", 0.0)), 0.0, 1.0)
                             u.gear = 'R' if str(cmd.get("gear", "D")).upper().startswith('R') else 'D'
+                            replay_entry["cmd"] = cmd
+                            replay_frames.append(replay_entry)
                         except Exception as e:
+                            replay_frames.append(replay_entry)
                             print(f"[IPC] comm fail: {e} -> connection will be reset")
                             ipc.close_connection()
                             student_connected = False
@@ -1439,6 +1661,34 @@ def main():
             "details": score_details,
             "reason": why,
         })
+        map_seed = None
+        if active_map_cfg:
+            state_entry = map_states.get(active_map_cfg["key"], {})
+            map_seed = state_entry.get("seed")
+
+        map_key = active_map_cfg.get("key") if active_map_cfg else None
+        map_name = active_map_cfg["name"] if active_map_cfg else None
+
+        replay_meta = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "map_key": map_key,
+            "map_name": map_name,
+            "map_seed": map_seed,
+            "target_idx": current_target_idx,
+            "stage": stage_idx,
+            "stage_label": stage_profile.get("label", f"{stage_idx}단계"),
+            "result": why,
+            "score": score_value,
+            "mode": args.mode,
+            "stats": {
+                "elapsed": round_stats.elapsed,
+                "distance": round_stats.distance,
+                "gear_switches": round_stats.gear_switches,
+                "avg_speed": score_details.get("avg_speed"),
+            },
+            "frame_count": len(replay_frames),
+        }
+        replay_path = save_replay_log(replay_frames, replay_meta)
 
         # 종료 오버레이
         screen.fill((245, 245, 245))
@@ -1486,6 +1736,8 @@ def main():
                 info_lines.append(f"IPC connected: {peer}")
             else:
                 info_lines.append(f"IPC waiting on {args.host}:{args.port}")
+        if replay_path:
+            info_lines.append(f"Replay: {replay_path}")
 
         if RECENT_RESULTS:
             info_lines.append("최근 3회 기록:")

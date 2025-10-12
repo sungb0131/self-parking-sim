@@ -1,5 +1,6 @@
-__pycache__/
+≈__pycache__/
 *.pyc
-student_algorithms.py
 .venv/
 .DS_Store
+replays/
+student_replays/
