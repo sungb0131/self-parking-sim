@@ -1927,14 +1927,20 @@ def main():
         round_stats.prev_gear = u.gear
         round_stats.min_abs_steer = abs(delta)
         replay_frames = []
+        waiting_for_ipc = False
 
         # ---- 메인 주행 루프 ----
         while why == "running":
+            waiting_overlay_active = bool(ipc and not ipc.is_connected)
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     why="quit"; break
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_p:
+                        if waiting_overlay_active:
+                            abort_to_menu = True
+                            why = "to_menu"
+                            break
                         paused = not paused
                         continue
                     if paused:
@@ -1947,6 +1953,8 @@ def main():
                             running = False
                             break
                 if why!="running": break
+            if why != "running":
+                break
 
             waiting_for_ipc = False
 
@@ -2161,7 +2169,7 @@ def main():
                 map_info = font.render(f"선택된 맵: {AVAILABLE_MAPS[selected_map_idx]['name']}", True, (70, 70, 70))
                 map_pos = ((sw - map_info.get_width()) // 2, info_pos[1] + info.get_height() + 16)
                 screen.blit(map_info, map_pos)
-                hint = font.render("P: 대기 화면", True, (80, 80, 80))
+                hint = font.render("P: 메인 화면", True, (80, 80, 80))
                 screen.blit(hint, ((sw - hint.get_width()) // 2, map_pos[1] + map_info.get_height() + 16))
             else:
                 screen.fill((245, 245, 245))
@@ -2210,7 +2218,7 @@ def main():
                         hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 대기: {args.host}:{args.port}"
                 else:
                     hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: WASD (W/S throttle, A/D steer, R gear, SPACE brake)"
-                hud_hint = "P: 대기 화면"
+                hud_hint = "P: 일시정지"
 
                 screen.blit(font.render(hud1, True, (0, 0, 0)), (12, 8))
                 screen.blit(font.render(hud2, True, (0, 0, 0)), (12, 26))
