@@ -1070,7 +1070,7 @@ def render_map_selection(
         placeholder = fonts["regular"].render("등록된 맵이 없습니다.", True, (110, 120, 140))
         surface.blit(placeholder, (main_rect.x + (main_rect.width - placeholder.get_width()) // 2, main_rect.y + main_rect.height // 2))
 
-    instructions = "← → 또는 A/D: 맵 변경  ·  Enter/Space: 선택  ·  TAB: 영역 이동  ·  ESC/Q: 종료"
+    instructions = "← → 또는 A/D: 맵 변경  ·  Enter/Space: 선택  ·  TAB: 영역 이동  ·  ESC/Q: 종료  ·  R: 리플레이 새로고침"
     instr_surface = fonts["regular"].render(instructions, True, (72, 82, 95))
     surface.blit(instr_surface, (main_rect.x + (main_rect.width - instr_surface.get_width()) // 2, main_rect.bottom - 48))
 
@@ -1235,18 +1235,6 @@ def render_selection_side_panel(
 
             replay_rects.append((idx, item_rect))
             y += replay_item_height + 12
-
-    instructions = [
-        "Enter: 실행 / 선택",
-        "Backspace: 알고리즘 종료",
-        "R: 리플레이 새로고침",
-        "TAB: 영역 이동",
-    ]
-    instr_y = sidebar_rect.bottom - len(instructions) * 24 - 28
-    for line in instructions:
-        instr_surface = font.render(line, True, (96, 105, 135))
-        surface.blit(instr_surface, (section_x, instr_y))
-        instr_y += 24
 
     return agent_rects, replay_rects, replay_window_start
 
