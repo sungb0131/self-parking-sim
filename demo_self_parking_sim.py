@@ -196,14 +196,23 @@ def discover_agent_entries(base_dir: Path) -> list[dict]:
             "label": "student_algorithms.py (로컬)",
             "path": local_agent,
             "cwd": base_dir,
+            "type": "process",
         })
-    sibling = (base_dir.parent / "self-parking-user-algorithms" / "my_agent.py").resolve()
+    sibling_dir = base_dir.parent / "self-parking-user-algorithms"
+    sibling = (sibling_dir / "my_agent.py").resolve()
     if sibling.exists():
         entries.append({
             "label": "self-parking-user-algorithms/my_agent.py",
             "path": sibling,
             "cwd": sibling.parent,
+            "type": "process",
         })
+    entries.append({
+        "label": "내장 WASD 조작 (동일 PC)",
+        "path": None,
+        "cwd": base_dir,
+        "type": "local_manual",
+    })
     return entries
 
 
@@ -215,17 +224,23 @@ class AgentManager:
         for entry in entries:
             self.entries.append({
                 "label": entry.get("label", "학생 알고리즘"),
-                "path": Path(entry.get("path")),
+                "path": Path(entry.get("path")) if entry.get("path") else None,
                 "cwd": Path(entry.get("cwd", Path.cwd())),
+                "type": entry.get("type", "process"),
             })
         self.python_executable = python_executable or sys.executable
         self.process: subprocess.Popen | None = None
         self.active_idx: int | None = None
+        self.manual_active: bool = False
 
     def is_running(self) -> bool:
+        if self.manual_active:
+            return True
         return self.process is not None and self.process.poll() is None
 
     def poll(self) -> None:
+        if self.manual_active:
+            return
         if self.process and self.process.poll() is not None:
             self.process = None
             self.active_idx = None
@@ -234,10 +249,20 @@ class AgentManager:
         if idx < 0 or idx >= len(self.entries):
             return False, "선택된 알고리즘이 없습니다."
         entry = self.entries[idx]
-        if not entry["path"].exists():
+        path_obj = entry["path"]
+        if path_obj is not None and not path_obj.exists():
             return False, "파일을 찾을 수 없습니다."
 
         self.stop()
+        entry_type = entry.get("type", "process")
+        if entry_type == "local_manual":
+            self.manual_active = True
+            self.active_idx = idx
+            return True, None
+
+        if entry["path"] is None:
+            return False, "실행 가능한 파일이 없습니다."
+
         cmd = [self.python_executable, str(entry["path"]), "--host", host, "--port", str(port)]
         try:
             self.process = subprocess.Popen(cmd, cwd=str(entry["cwd"]))
@@ -249,6 +274,10 @@ class AgentManager:
             return False, str(exc)
 
     def stop(self) -> None:
+        if self.manual_active:
+            self.manual_active = False
+            self.active_idx = None
+            return
         if self.process and self.process.poll() is None:
             try:
                 self.process.terminate()
@@ -259,6 +288,9 @@ class AgentManager:
                 pass
         self.process = None
         self.active_idx = None
+
+    def is_manual_active(self) -> bool:
+        return self.manual_active and self.active_idx is not None
 
 # ----------------- 유틸 -----------------
 def clamp(x,a,b): return max(a, min(b,x))
@@ -1289,13 +1321,21 @@ def map_selection_loop(
         if agent_manager:
             agent_manager.poll()
             for idx, entry in enumerate(agent_manager.entries):
-                exists = entry["path"].exists()
-                running_proc = agent_manager.is_running() and agent_manager.active_idx == idx
+                path_obj = entry["path"]
+                exists = True if path_obj is None else path_obj.exists()
+                entry_type = entry.get("type", "process")
+                if entry_type == "local_manual":
+                    running_proc = agent_manager.is_manual_active() and agent_manager.active_idx == idx
+                    available = True
+                else:
+                    running_proc = agent_manager.is_running() and agent_manager.active_idx == idx
+                    available = exists
                 agent_entries_info.append({
                     "label": entry.get("label", "학생 알고리즘"),
                     "exists": exists,
-                    "available": exists,
+                    "available": available,
                     "running": running_proc,
+                    "type": entry_type,
                 })
         current_agent_active = agent_manager.active_idx if agent_manager and agent_manager.is_running() else None
         if prev_agent_active is not None and current_agent_active is None and agent_message is None:
@@ -1814,6 +1854,7 @@ def main():
     running=True
     while running:
         if ui_mode == "map_select":
+            manual_override_active = agent_manager.is_manual_active() if agent_manager else False
             if map_seeds_dirty:
                 reseed_map_states(map_states, AVAILABLE_MAPS)
                 map_cache.clear()
@@ -1827,7 +1868,7 @@ def main():
                 AVAILABLE_MAPS,
                 map_cache,
                 map_states,
-                ipc=ipc if args.mode == "ipc" else None,
+                ipc=ipc if (args.mode == "ipc" and not manual_override_active) else None,
                 host=args.host,
                 port=args.port,
                 initial_idx=selected_map_idx,
@@ -1883,8 +1924,6 @@ def main():
             H, W = M.C.shape
             ui_mode = "sim_round"
             banner_show_until = 0
-            student_connected = ipc.is_connected if ipc else False
-            map_sent = False
             continue
 
         if M is None:
@@ -1892,6 +1931,15 @@ def main():
             ui_mode = "map_select"
             map_seeds_dirty = True
             continue
+
+        manual_override_active = agent_manager.is_manual_active() if agent_manager else False
+        control_mode = "local_wasd" if (args.mode == "wasd" or manual_override_active) else "ipc"
+        if control_mode == "ipc":
+            student_connected = ipc.is_connected if ipc else False
+            map_sent = False
+        else:
+            student_connected = False
+            map_sent = True
 
         # 2) 시뮬레이션 라운드 초기화
         P = Params()
@@ -1931,7 +1979,7 @@ def main():
 
         # ---- 메인 주행 루프 ----
         while why == "running":
-            waiting_overlay_active = bool(ipc and not ipc.is_connected)
+            waiting_overlay_active = (control_mode == "ipc") and bool(ipc and not ipc.is_connected)
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     why="quit"; break
@@ -1958,7 +2006,7 @@ def main():
 
             waiting_for_ipc = False
 
-            if args.mode == "wasd":
+            if control_mode == "local_wasd":
                 # 키 입력 (디버그/예비용)
                 keys = pygame.key.get_pressed()
                 if not paused:
@@ -2149,7 +2197,7 @@ def main():
                     break
 
         # ---- 렌더 ----
-            if args.mode == "ipc" and waiting_for_ipc:
+            if control_mode == "ipc" and waiting_for_ipc:
                 screen.fill((255, 255, 255))
                 title = font_title.render("PARKING - SIM", True, (20, 20, 20))
                 title_pos = ((sw - title.get_width()) // 2, sh // 3 - title.get_height() // 2)
@@ -2210,14 +2258,17 @@ def main():
                 # HUD (세 줄 구성)
                 hud1 = f"t={t:5.1f}s  gear={u.gear}  v={state.v:5.2f} m/s  steer={math.degrees(delta):6.1f} deg"
                 hud2 = f"accel={u.accel*100:5.1f}%  brake={u.brake*100:5.1f}%  collisions={collision_count}"
-                if args.mode == "ipc":
+                if control_mode == "ipc":
                     if ipc.is_connected:
                         peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
                         hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 연결: {peer}"
                     else:
                         hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 대기: {args.host}:{args.port}"
                 else:
-                    hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: WASD (W/S throttle, A/D steer, R gear, SPACE brake)"
+                    if args.mode == "wasd":
+                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: WASD (W/S throttle, A/D steer, R gear, SPACE brake)"
+                    else:
+                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: 내장 WASD (학생 알고리즘 없음)"
                 hud_hint = "P: 일시정지"
 
                 screen.blit(font.render(hud1, True, (0, 0, 0)), (12, 8))
@@ -2243,7 +2294,7 @@ def main():
                     ]
                     draw_pause_overlay(screen, fonts, sw, sh, stats_lines, instruction_lines)
 
-                if args.mode == "ipc" and pygame.time.get_ticks() < banner_show_until:
+                if control_mode == "ipc" and pygame.time.get_ticks() < banner_show_until:
                     banner = font_large.render("Student algorithm connected!", True, (30, 110, 40))
                     banner_pos = (vp_ox + (vp_w - banner.get_width()) // 2, vp_oy + 20)
                     screen.blit(banner, banner_pos)
@@ -2287,6 +2338,7 @@ def main():
         map_key = active_map_cfg.get("key") if active_map_cfg else None
         map_name = active_map_cfg["name"] if active_map_cfg else None
 
+        replay_mode_label = "manual_wasd" if control_mode == "local_wasd" else args.mode
         replay_meta = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "map_key": map_key,
@@ -2297,7 +2349,7 @@ def main():
             "stage_label": stage_profile.get("label", f"{stage_idx}단계"),
             "result": why,
             "score": score_value,
-            "mode": args.mode,
+            "mode": replay_mode_label,
             "stats": {
                 "elapsed": round_stats.elapsed,
                 "distance": round_stats.distance,
@@ -2348,7 +2400,7 @@ def main():
                 f"속도 비율: {score_details.get('speed_ratio', 0.0):.2f}",
             ])
         info_lines.append(f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}")
-        if args.mode == "ipc":
+        if control_mode == "ipc":
             if ipc and ipc.is_connected:
                 peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
                 info_lines.append(f"IPC connected: {peer}")
@@ -2386,6 +2438,10 @@ def main():
                 running = False
                 waiting = False
             if keys[pygame.K_r]:
+                waiting = False
+            if keys[pygame.K_m]:
+                ui_mode = "map_select"
+                return_to_selection = True
                 waiting = False
             if keys[pygame.K_p]:
                 ui_mode = "map_select"
