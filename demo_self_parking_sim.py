@@ -62,6 +62,7 @@ ACCENT_COLOR = (65, 110, 220)
 HIGHLIGHT_ALPHA = 80
 STEER_FLIP_DEADZONE = math.radians(2.0)
 MIN_TARGET_DISTANCE = 8.0  # meters; ensure target slot not adjacent to start
+LEFT_EXCLUDE_MARGIN = 6.0  # meters; ignore slots hugging the left wall
 
 
 def enforce_min_window_size(width: int, height: int) -> tuple[int, int]:
@@ -2013,12 +2014,28 @@ def main():
             cx, cy = slot_center(idx)
             return math.hypot(cx - start_x, cy - start_y) >= MIN_TARGET_DISTANCE
 
-        candidate_indices = [i for i in free_slot_indices if is_far_enough(i)]
+        left_limit = xmin + LEFT_EXCLUDE_MARGIN
 
-        if current_target_idx in free_slot_indices and is_far_enough(current_target_idx):
+        def is_left_excluded(idx: int) -> bool:
+            cx, _ = slot_center(idx)
+            return cx <= left_limit
+
+        candidate_indices = [i for i in free_slot_indices if not is_left_excluded(i) and is_far_enough(i)]
+        allowed_indices = [i for i in free_slot_indices if not is_left_excluded(i)]
+
+        if (
+            current_target_idx in free_slot_indices
+            and not is_left_excluded(current_target_idx)
+            and is_far_enough(current_target_idx)
+        ):
             target_idx = current_target_idx
         else:
-            pick_pool = candidate_indices if candidate_indices else free_slot_indices
+            if candidate_indices:
+                pick_pool = candidate_indices
+            elif allowed_indices:
+                pick_pool = allowed_indices
+            else:
+                pick_pool = free_slot_indices
             target_idx = random.choice(pick_pool)
             current_target_idx = target_idx
             if active_map_cfg:
