@@ -61,6 +61,7 @@ MAP_CARD_ASPECT = 16 / 9
 ACCENT_COLOR = (65, 110, 220)
 HIGHLIGHT_ALPHA = 80
 STEER_FLIP_DEADZONE = math.radians(2.0)
+MIN_TARGET_DISTANCE = 8.0  # meters; ensure target slot not adjacent to start
 
 
 def enforce_min_window_size(width: int, height: int) -> tuple[int, int]:
@@ -1992,23 +1993,37 @@ def main():
             map_sent = True
 
         # 2) 시뮬레이션 라운드 초기화
-        P = Params()
-        free_slot_indices = [i for i, occ in enumerate(M.occupied_idx) if not occ]
-        if not free_slot_indices:
-            raise RuntimeError("맵에 사용 가능한 주차 슬롯이 없습니다.")
-        if current_target_idx in free_slot_indices:
-            target_idx = current_target_idx
-        else:
-            target_idx = random.choice(free_slot_indices)
-            current_target_idx = target_idx
-            if active_map_cfg:
-                map_states[active_map_cfg["key"]]["target_idx"] = current_target_idx
-        target_slot = tuple(M.slots[target_idx].tolist())
-
         # 고정 시작 위치/자세 (좌하단 슬롯 근처, 위쪽을 바라보도록 설정)
         start_x = xmin + 4.0
         start_y = ymin + 6.0
         start_yaw = math.radians(90.0)
+
+        P = Params()
+        free_slot_indices = [i for i, occ in enumerate(M.occupied_idx) if not occ]
+        if not free_slot_indices:
+            raise RuntimeError("맵에 사용 가능한 주차 슬롯이 없습니다.")
+
+        def slot_center(idx: int) -> tuple[float, float]:
+            rect = M.slots[idx]
+            cx = (rect[0] + rect[1]) * 0.5
+            cy = (rect[2] + rect[3]) * 0.5
+            return cx, cy
+
+        def is_far_enough(idx: int) -> bool:
+            cx, cy = slot_center(idx)
+            return math.hypot(cx - start_x, cy - start_y) >= MIN_TARGET_DISTANCE
+
+        candidate_indices = [i for i in free_slot_indices if is_far_enough(i)]
+
+        if current_target_idx in free_slot_indices and is_far_enough(current_target_idx):
+            target_idx = current_target_idx
+        else:
+            pick_pool = candidate_indices if candidate_indices else free_slot_indices
+            target_idx = random.choice(pick_pool)
+            current_target_idx = target_idx
+            if active_map_cfg:
+                map_states[active_map_cfg["key"]]["target_idx"] = current_target_idx
+        target_slot = tuple(M.slots[target_idx].tolist())
 
         state = State(start_x, start_y, start_yaw, 0.0)
         u = InputCmd()
@@ -2477,7 +2492,6 @@ def main():
 
         info_lines.append("")
         info_lines.append(f"맵 시드: {map_seed if map_seed is not None else '-'}")
->>>>>>> b0654fc (Improve map randomization, scoring UI, and add steer flip metric)
         if control_mode == "ipc":
             if ipc and ipc.is_connected:
                 peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
