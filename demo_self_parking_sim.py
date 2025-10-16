@@ -60,6 +60,7 @@ MAP_CARD_PADDING = 32
 MAP_CARD_ASPECT = 16 / 9
 ACCENT_COLOR = (65, 110, 220)
 HIGHLIGHT_ALPHA = 80
+STEER_FLIP_DEADZONE = math.radians(2.0)
 
 
 def enforce_min_window_size(width: int, height: int) -> tuple[int, int]:
@@ -441,7 +442,9 @@ class RoundStats:
     avg_speed_accum: float = 0.0
     speed_samples: int = 0
     min_abs_steer: float = float("inf")
+    direction_flips: int = 0
     prev_gear: str = "D"
+    prev_delta_sign: int = 0
 
 # ----------------- 모델/차량 -----------------
 def step_kinematic(state: State, delta, a, P: Params):
@@ -587,12 +590,31 @@ def generate_map_thumbnail(M: MapAssets, size=(280, 160), highlight_idx: int | N
 
     return surface
 
+def _ensure_at_least_one_free_slot(M: MapAssets, rng: random.Random) -> None:
+    """모든 슬롯이 점유된 경우 하나를 무작위로 비워 타깃을 선택할 수 있도록 보정."""
+    if M.slots.size == 0:
+        return
+    if np.all(M.occupied_idx):
+        free_idx = rng.randrange(len(M.occupied_idx))
+        M.occupied_idx[free_idx] = False
+
+
 def apply_map_variant(base: MapAssets, variant: str, seed: int | None = None) -> MapAssets:
     """기본 맵 자산에 변형을 적용해 다른 난이도/환경을 구성."""
-    if not variant:
-        return base
     rng = random.Random(seed)
     M = copy.deepcopy(base)
+
+    # 기본 점유 상태도 매번 시드를 통해 섞어 변화를 준다.
+    total_slots = len(M.occupied_idx)
+    if total_slots > 0:
+        occupied_total = int(np.count_nonzero(M.occupied_idx))
+        occupied_total = min(occupied_total, max(0, total_slots - 1))  # 최소 한 슬롯은 비워 둔다.
+        shuffled = list(range(total_slots))
+        rng.shuffle(shuffled)
+        new_occ = np.zeros(total_slots, dtype=bool)
+        if occupied_total > 0:
+            new_occ[np.array(shuffled[:occupied_total])] = True
+        M.occupied_idx = new_occ
 
     if variant == "dense_center":
         occupied = M.occupied_idx.copy()
@@ -617,9 +639,17 @@ def apply_map_variant(base: MapAssets, variant: str, seed: int | None = None) ->
                 M.walls_rects = np.array(extras, dtype=float)
             else:
                 M.walls_rects = np.vstack([M.walls_rects, np.array(extras, dtype=float)])
+    elif variant == "single_free_slot":
+        # 하나의 슬롯만 비워 놓고 나머지는 모두 점유 상태로 만든다.
+        if total_slots > 0:
+            occ = np.ones(total_slots, dtype=bool)
+            free_idx = rng.randrange(total_slots)
+            occ[free_idx] = False
+            M.occupied_idx = occ
     elif variant == "open_training":
         # 거의 모든 점유 슬롯을 비워 넓은 연습장을 만든다.
         M.occupied_idx = np.zeros_like(M.occupied_idx, dtype=bool)
+    _ensure_at_least_one_free_slot(M, rng)
     return M
 
 AVAILABLE_MAPS = [
@@ -641,10 +671,10 @@ AVAILABLE_MAPS = [
     },
     {
         "key": "training_course",
-        "name": "장애물 훈련장",
+        "name": "만석 주차장",
         "filename": "parking_assets_layers_75x50.mat",
-        "summary": "중앙 통로에 임시 장애물을 배치한 연습 코스",
-        "variant": "one_way_training",
+        "summary": "주차 슬롯 한 칸만 비어 있는 극한 환경",
+        "variant": "single_free_slot",
         "stage": 3,
     },
 ]
@@ -657,11 +687,13 @@ STAGE_RULES = {
         "distance_factor": 0.85,
         "turn_target": 2,
         "speed_target": 2.5,
+        "steer_flip_target": 4,
         "weights": {
-            "time": 35.0,
-            "distance": 35.0,
+            "time": 30.0,
+            "distance": 30.0,
             "turn": 20.0,
             "speed": 10.0,
+            "steer_flip": 10.0,
         },
     },
     2: {
@@ -671,11 +703,13 @@ STAGE_RULES = {
         "distance_factor": 0.95,
         "turn_target": 3,
         "speed_target": 3.0,
+        "steer_flip_target": 5,
         "weights": {
-            "time": 30.0,
-            "distance": 30.0,
-            "turn": 25.0,
-            "speed": 15.0,
+            "time": 28.0,
+            "distance": 28.0,
+            "turn": 22.0,
+            "speed": 12.0,
+            "steer_flip": 10.0,
         },
     },
     3: {
@@ -685,11 +719,13 @@ STAGE_RULES = {
         "distance_factor": 1.05,
         "turn_target": 4,
         "speed_target": 3.5,
+        "steer_flip_target": 6,
         "weights": {
-            "time": 28.0,
-            "distance": 32.0,
-            "turn": 25.0,
-            "speed": 15.0,
+            "time": 26.0,
+            "distance": 28.0,
+            "turn": 24.0,
+            "speed": 12.0,
+            "steer_flip": 10.0,
         },
     },
 }
@@ -712,6 +748,7 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     }
 
     if result_reason != "success":
+        details["score"] = 0.0
         return 0.0, details
 
     xmin, xmax, ymin, ymax = world_extent
@@ -722,6 +759,7 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     distance_target = max(1e-6, diag * distance_factor)
     turn_target = max(1, int(stage_profile.get("turn_target", 1)))
     speed_target = max(1e-6, float(stage_profile.get("speed_target", 1.0)))
+    steer_flip_target = max(1, int(stage_profile.get("steer_flip_target", 1)))
     weights = stage_profile.get("weights", {})
 
     time_ratio = stats.elapsed / time_target if time_target > 0 else 0.0
@@ -729,25 +767,37 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     turn_ratio = stats.gear_switches / turn_target
     avg_speed = details["avg_speed"]
     speed_ratio = avg_speed / speed_target
+    steer_flip_ratio = stats.direction_flips / steer_flip_target
 
     penalties = (
         weights.get("time", 0.0) * clamp(time_ratio, 0.0, 2.0) +
         weights.get("distance", 0.0) * clamp(dist_ratio, 0.0, 2.0) +
         weights.get("turn", 0.0) * clamp(turn_ratio, 0.0, 2.0) +
-        weights.get("speed", 0.0) * clamp(speed_ratio, 0.0, 2.0)
+        weights.get("speed", 0.0) * clamp(speed_ratio, 0.0, 2.0) +
+        weights.get("steer_flip", 0.0) * clamp(steer_flip_ratio, 0.0, 2.0)
     )
 
     base_score = stage_profile.get("base_score", 100.0)
-    score = clamp(base_score - penalties, 0.0, base_score)
+    metric_score = clamp(base_score - penalties, 0.0, base_score)
+    safe_base = 50.0
+    bonus_band = max(0.0, 100.0 - safe_base)
+    ratio = (metric_score / base_score) if base_score > 1e-6 else 0.0
+    performance_component = bonus_band * clamp(ratio, 0.0, 1.0)
+    final_score = clamp(safe_base + performance_component, 0.0, safe_base + bonus_band)
 
     details.update({
         "time_ratio": time_ratio,
         "dist_ratio": dist_ratio,
         "turn_ratio": turn_ratio,
         "speed_ratio": speed_ratio,
-        "score": score,
+        "steer_flip_ratio": steer_flip_ratio,
+        "steer_flip_target": steer_flip_target,
+        "metric_score": metric_score,
+        "performance_component": performance_component,
+        "safe_base": safe_base,
+        "score": final_score,
     })
-    return score, details
+    return final_score, details
 
 def _slugify(text: str) -> str:
     slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in text)
@@ -1974,6 +2024,7 @@ def main():
         round_stats = RoundStats()
         round_stats.prev_gear = u.gear
         round_stats.min_abs_steer = abs(delta)
+        round_stats.prev_delta_sign = 0
         replay_frames = []
         waiting_for_ipc = False
 
@@ -2116,6 +2167,14 @@ def main():
                     round_stats.gear_switches += 1
                     round_stats.prev_gear = u.gear
                 round_stats.min_abs_steer = min(round_stats.min_abs_steer, abs(delta))
+                steer_sign = 0
+                if abs(delta) >= STEER_FLIP_DEADZONE:
+                    steer_sign = 1 if delta > 0 else -1
+                if steer_sign != 0:
+                    prev_sign = round_stats.prev_delta_sign
+                    if prev_sign != 0 and steer_sign != prev_sign:
+                        round_stats.direction_flips += 1
+                    round_stats.prev_delta_sign = steer_sign
 
                 # 가감속 합성(+ coast)
                 sgn = +1.0 if u.gear == 'D' else -1.0
@@ -2383,34 +2442,54 @@ def main():
         title = "SUCCESS" if why == "success" else ("TIMEOUT" if why == "timeout" else "COLLISION" if why == "collision" else "QUIT")
         stage_label = stage_profile.get("label", f"{stage_idx}단계")
         avg_speed = score_details.get("avg_speed", 0.0)
-        info_lines = [
-            f"Score: {score_value:.1f}",
-            f"Stage: {stage_label}",
-            f"Elapsed: {round_stats.elapsed:.1f} s",
-            f"Distance: {round_stats.distance:.1f} m",
-            f"Gear switches: {round_stats.gear_switches}",
-            f"Avg speed: {avg_speed:.2f} m/s",
-            f"Collisions: {collision_count}",
-        ]
+        info_lines = []
+        info_lines.append(f"총점 {score_value:.1f} / 100")
         if why == "success":
-            info_lines.extend([
-                f"시간 비율: {score_details.get('time_ratio', 0.0):.2f}",
-                f"거리 비율: {score_details.get('dist_ratio', 0.0):.2f}",
-                f"방향전환 비율: {score_details.get('turn_ratio', 0.0):.2f}",
-                f"속도 비율: {score_details.get('speed_ratio', 0.0):.2f}",
-            ])
-        info_lines.append(f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}")
+            perf = score_details.get("performance_component", 0.0)
+            safe_base = score_details.get("safe_base", 50.0)
+            info_lines.append(f"구성: 안전 {safe_base:.0f} + 성과 {perf:.1f}")
+        info_lines.append(f"{stage_label} · {AVAILABLE_MAPS[selected_map_idx]['name']}")
+
+        info_lines.append("")
+        info_lines.append(f"주행 시간 {round_stats.elapsed:.1f}s")
+        info_lines.append(f"이동 거리 {round_stats.distance:.1f}m")
+        info_lines.append(f"평균 속도 {avg_speed:.2f}m/s")
+        info_lines.append(f"기어 전환 {round_stats.gear_switches}회")
+        info_lines.append(f"충돌 {collision_count}회")
+        info_lines.append(f"조향 방향 전환 {round_stats.direction_flips}회")
+
+        if why == "success":
+            xmin, xmax, ymin, ymax = M.extent
+            diag = math.hypot(xmax - xmin, ymax - ymin)
+            time_target = stage_profile.get("time_target", 0.0)
+            distance_target = diag * stage_profile.get("distance_factor", 1.0)
+            turn_target = stage_profile.get("turn_target", 0)
+            speed_target = stage_profile.get("speed_target", 0.0)
+            steer_flip_target = stage_profile.get("steer_flip_target", 0)
+            info_lines.append("")
+            info_lines.append("목표 대비")
+            if time_target > 0:
+                info_lines.append(f"- 시간 {round_stats.elapsed:.1f}s / {time_target:.1f}s")
+            info_lines.append(f"- 거리 {round_stats.distance:.1f}m / {distance_target:.1f}m")
+            info_lines.append(f"- 기어 전환 {round_stats.gear_switches}회 / {turn_target}회")
+            info_lines.append(f"- 평균 속도 {avg_speed:.2f}m/s / {speed_target:.2f}m/s")
+            info_lines.append(f"- 조향 전환 {round_stats.direction_flips}회 / {steer_flip_target}회")
+
+        info_lines.append("")
+        info_lines.append(f"맵 시드: {map_seed if map_seed is not None else '-'}")
+>>>>>>> b0654fc (Improve map randomization, scoring UI, and add steer flip metric)
         if control_mode == "ipc":
             if ipc and ipc.is_connected:
                 peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
-                info_lines.append(f"IPC connected: {peer}")
+                info_lines.append(f"IPC 연결: {peer}")
             else:
-                info_lines.append(f"IPC waiting on {args.host}:{args.port}")
+                info_lines.append(f"IPC 대기: {args.host}:{args.port}")
         if replay_path:
-            info_lines.append(f"Replay: {replay_path}")
+            info_lines.append(f"리플레이: {replay_path}")
 
         if RECENT_RESULTS:
-            info_lines.append("최근 3회 기록:")
+            info_lines.append("")
+            info_lines.append("최근 3회 기록")
             reason_map = {
                 "success": "성공",
                 "collision": "충돌",
