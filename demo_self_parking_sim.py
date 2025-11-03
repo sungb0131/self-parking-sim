@@ -50,6 +50,7 @@ MARKER_COLORS = {
     "occupied_slot": (210, 150, 40),
     "stationary": (140, 60, 180),
     "unknown": (80, 80, 80),
+    "line": (30, 30, 30),
 }
 
 BASE_WINDOW_SIZE = (1600, 1000)
@@ -600,6 +601,137 @@ def _ensure_at_least_one_free_slot(M: MapAssets, rng: random.Random) -> None:
         free_idx = rng.randrange(len(M.occupied_idx))
         M.occupied_idx[free_idx] = False
 
+CAR_LENGTH = 3.0  # 차량 길이(전후 오버행 포함)
+CAR_WIDTH = 1.6   # 차량 폭
+SLOT_LENGTH_MARGIN = 1.2  # 슬롯 길이 마진 (전후 총합)
+SLOT_WIDTH_MARGIN = 0.6   # 슬롯 폭 마진 (좌우 총합)
+ENABLE_STATIONARY_COLLISIONS = False
+ENABLE_BOUNDARY_COLLISIONS = True
+LINE_COLLISION_HALF_WIDTH = 0.25
+
+def scale_map_geometry(M: MapAssets, factor: float) -> None:
+    """맵 전체를 중심 기준으로 축소/확대해 슬롯·경계를 일괄 조정."""
+    if factor <= 0:
+        return
+
+    xmin, xmax, ymin, ymax = M.extent
+    cx = (xmin + xmax) * 0.5
+    cy = (ymin + ymax) * 0.5
+
+    def scale_x(values):
+        return cx + (values - cx) * factor
+
+    def scale_y(values):
+        return cy + (values - cy) * factor
+
+    M.extent = (
+        float(scale_x(xmin)),
+        float(scale_x(xmax)),
+        float(scale_y(ymin)),
+        float(scale_y(ymax)),
+    )
+
+    bxmin, bxmax, bymin, bymax = M.border
+    M.border = (
+        float(scale_x(bxmin)),
+        float(scale_x(bxmax)),
+        float(scale_y(bymin)),
+        float(scale_y(bymax)),
+    )
+
+    if M.slots.size > 0:
+        M.slots[:, 0] = scale_x(M.slots[:, 0])
+        M.slots[:, 1] = scale_x(M.slots[:, 1])
+        M.slots[:, 2] = scale_y(M.slots[:, 2])
+        M.slots[:, 3] = scale_y(M.slots[:, 3])
+
+    if M.lines.size > 0:
+        M.lines[:, 0] = scale_x(M.lines[:, 0])
+        M.lines[:, 2] = scale_x(M.lines[:, 2])
+        M.lines[:, 1] = scale_y(M.lines[:, 1])
+        M.lines[:, 3] = scale_y(M.lines[:, 3])
+
+    if M.walls_rects.size > 0:
+        M.walls_rects[:, 0] = scale_x(M.walls_rects[:, 0])
+        M.walls_rects[:, 1] = scale_x(M.walls_rects[:, 1])
+        M.walls_rects[:, 2] = scale_y(M.walls_rects[:, 2])
+        M.walls_rects[:, 3] = scale_y(M.walls_rects[:, 3])
+
+    M.cellSize *= factor
+
+def resize_slots_to_vehicle(M: MapAssets) -> None:
+    """슬롯 크기를 차량 크기에 맞춰 보정한다."""
+    if M.slots.size == 0:
+        return
+
+    half_width = 0.5 * (CAR_WIDTH + SLOT_WIDTH_MARGIN)
+    half_length = 0.5 * (CAR_LENGTH + SLOT_LENGTH_MARGIN)
+    xmin, xmax, ymin, ymax = M.extent
+
+    centers_x = 0.5 * (M.slots[:, 0] + M.slots[:, 1])
+    centers_y = 0.5 * (M.slots[:, 2] + M.slots[:, 3])
+
+    M.slots[:, 0] = np.clip(centers_x - half_width, xmin, xmax)
+    M.slots[:, 1] = np.clip(centers_x + half_width, xmin, xmax)
+    M.slots[:, 2] = np.clip(centers_y - half_length, ymin, ymax)
+    M.slots[:, 3] = np.clip(centers_y + half_length, ymin, ymax)
+
+
+def open_top_parking_lane(M: MapAssets, tolerance: float = 0.25) -> None:
+    """상단 주차장 라인을 제거해 위쪽 통로를 개방한다."""
+    top = float(M.extent[3])
+    if M.lines.size > 0:
+        keep_lines = []
+        horiz_y = [
+            float(line[1])
+            for line in M.lines
+            if np.isclose(line[1], line[3], atol=tolerance)
+        ]
+        top_slot_y = max(horiz_y) if horiz_y else None
+        for line in M.lines:
+            y1, y2 = float(line[1]), float(line[3])
+            if np.isclose(y1, top, atol=tolerance) and np.isclose(y2, top, atol=tolerance):
+                continue  # remove horizontal line hugging the very top
+            if (
+                top_slot_y is not None
+                and np.isclose(y1, y2, atol=tolerance)
+                and np.isclose(y1, top_slot_y, atol=max(tolerance, 0.6))
+            ):
+                continue  # remove the top-most slot boundary
+            keep_lines.append(line)
+        M.lines = np.array(keep_lines, dtype=float) if keep_lines else np.zeros((0, 4), dtype=float)
+
+def compute_line_rects(M: MapAssets, half_width: float = LINE_COLLISION_HALF_WIDTH) -> np.ndarray:
+    """슬롯 라인을 충돌 판정을 위해 얇은 직사각형으로 변환."""
+    if M.lines.size == 0:
+        return np.zeros((0, 4), dtype=float)
+    rects = []
+    xmin, xmax, ymin, ymax = M.extent
+    for x1, y1, x2, y2 in M.lines:
+        if np.isclose(x1, x2, atol=1e-6):  # vertical segment
+            x_min = min(x1, x2) - half_width
+            x_max = max(x1, x2) + half_width
+            y_min = min(y1, y2)
+            y_max = max(y1, y2)
+        elif np.isclose(y1, y2, atol=1e-6):  # horizontal segment
+            x_min = min(x1, x2)
+            x_max = max(x1, x2)
+            y_min = min(y1, y2) - half_width
+            y_max = max(y1, y2) + half_width
+        else:
+            x_min = min(x1, x2) - half_width
+            x_max = max(x1, x2) + half_width
+            y_min = min(y1, y2) - half_width
+            y_max = max(y1, y2) + half_width
+        x_min = max(x_min, xmin)
+        x_max = min(x_max, xmax)
+        y_min = max(y_min, ymin)
+        y_max = min(y_max, ymax)
+        if x_max <= x_min or y_max <= y_min:
+            continue
+        rects.append([x_min, x_max, y_min, y_max])
+    return np.array(rects, dtype=float)
+
 
 def apply_map_variant(base: MapAssets, variant: str, seed: int | None = None) -> MapAssets:
     """기본 맵 자산에 변형을 적용해 다른 난이도/환경을 구성."""
@@ -648,6 +780,19 @@ def apply_map_variant(base: MapAssets, variant: str, seed: int | None = None) ->
             free_idx = rng.randrange(total_slots)
             occ[free_idx] = False
             M.occupied_idx = occ
+        # 3단계는 완전 만차 시나리오로 장애물을 제거하고 맵을 축소한다.
+        scale_map_geometry(M, factor=0.8)
+        if M.walls_rects.size > 0:
+            xmin, xmax, ymin, ymax = M.extent
+            mask = (
+                np.isclose(M.walls_rects[:, 0], xmin, atol=1e-3) |
+                np.isclose(M.walls_rects[:, 1], xmax, atol=1e-3) |
+                np.isclose(M.walls_rects[:, 2], ymin, atol=1e-3) |
+                np.isclose(M.walls_rects[:, 3], ymax, atol=1e-3)
+            )
+            M.walls_rects = M.walls_rects[mask] if mask.any() else np.zeros((0, 4), dtype=float)
+        if M.Cs.size > 0:
+            M.Cs.fill(0.0)
     elif variant == "open_training":
         # 거의 모든 점유 슬롯을 비워 넓은 연습장을 만든다.
         M.occupied_idx = np.zeros_like(M.occupied_idx, dtype=bool)
@@ -872,6 +1017,9 @@ def ensure_map_loaded(map_cfg: dict, cache: dict, seed: int | None = None) -> di
             assets = apply_map_variant(base, variant, seed)
         else:
             assets = copy.deepcopy(base)
+        resize_slots_to_vehicle(assets)
+        open_top_parking_lane(assets)
+        assets.line_rects = compute_line_rects(assets)
         seed_val = seed if seed is not None else 0
         target_rng = random.Random(seed_val ^ 0x5F3759DF)
         free_idx = np.where(~assets.occupied_idx)[0]
@@ -2240,13 +2388,14 @@ def main():
                 collision_reason = None
                 collision_marker = None
 
-                # (A) 경계 밖은 즉시 충돌로 유지. [UPDATE] 감지 지점 기록 추가.
-                for (vx, vy) in car_poly:
-                    if not (xmin <= vx <= xmax and ymin <= vy <= ymax):
-                        collided = True
-                        collision_reason = "boundary"
-                        collision_marker = (clamp(vx, xmin, xmax), clamp(vy, ymin, ymax))
-                        break
+                # (A) 경계 충돌은 필요 시에만 사용.
+                if ENABLE_BOUNDARY_COLLISIONS:
+                    for (vx, vy) in car_poly:
+                        if not (xmin <= vx <= xmax and ymin <= vy <= ymax):
+                            collided = True
+                            collision_reason = "boundary"
+                            collision_marker = (clamp(vx, xmin, xmax), clamp(vy, ymin, ymax))
+                            break
 
                 # (B) 점유된 슬롯과 SAT 충돌
                 if not collided:
@@ -2259,14 +2408,27 @@ def main():
                             collision_marker = ((rect[0] + rect[1]) * 0.5, (rect[2] + rect[3]) * 0.5)
                             break
 
-                # (C) 정지물 레이어와 고정밀 교차 검사
+                # (C) 주차 라인과 충돌
                 if not collided:
+                    line_rects = getattr(M, "line_rects", None)
+                    if line_rects is None:
+                        line_rects = compute_line_rects(M)
+                        M.line_rects = line_rects
+                    for rect in line_rects:
+                        if poly_intersects_rect(car_poly, tuple(rect)):
+                            collided = True
+                            collision_reason = "line"
+                            collision_marker = ((rect[0] + rect[1]) * 0.5, (rect[2] + rect[3]) * 0.5)
+                            break
+
+                # (D) 정지물 레이어와 고정밀 교차 검사
+                if not collided and ENABLE_STATIONARY_COLLISIONS:
                     collided, hit_point = detect_stationary_collision(car_poly, M, threshold=M.FreeThr)
                     if collided:
                         collision_reason = "stationary"
                         collision_marker = hit_point
 
-                # (D) 타깃 슬롯 내부는 허용
+                # (E) 타깃 슬롯 내부는 허용
                 if rect_contains_poly(target_slot, car_poly):
                     collided = False
                     collision_reason = None
