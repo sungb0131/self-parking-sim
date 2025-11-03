@@ -522,18 +522,20 @@ class InputCmd:
 
 @dataclass
 class RoundStats:
-    elapsed: float = 0.0
-    distance: float = 0.0
-    gear_switches: int = 0
-    avg_speed_accum: float = 0.0
-    speed_samples: int = 0
-    min_abs_steer: float = float("inf")
-    direction_flips: int = 0
-    prev_gear: str = "D"
-    prev_delta_sign: int = 0
-    final_iou: float = 0.0
-    final_orientation: str = "unknown"
-    final_speed: float = 0.0
+    """라운드 동안 누적되는 주행 지표를 담습니다."""
+
+    elapsed: float = 0.0          # 주행에 소요된 시간을 초 단위로 누적합니다.
+    distance: float = 0.0         # 이동 거리를 미터 단위로 누적합니다.
+    gear_switches: int = 0        # 기어 전환 횟수를 기록합니다.
+    avg_speed_accum: float = 0.0  # 평균 속도 계산을 위해 속도의 합을 누적합니다.
+    speed_samples: int = 0        # 속도 샘플 개수를 기록합니다.
+    min_abs_steer: float = float("inf")  # 주차 후 직각 정렬 여부를 판단하기 위해 최소 조향 각도를 기록합니다.
+    direction_flips: int = 0            # 전진↔후진 전환 횟수를 누적합니다.
+    prev_gear: str = "D"                # 전환 감지를 위해 직전 기어를 기억합니다.
+    prev_delta_sign: int = 0            # 조향 변경 횟수 세기를 위한 직전 각도 부호를 저장합니다.
+    final_iou: float = 0.0              # 종료 시 차량과 슬롯의 IoU를 기록합니다.
+    final_orientation: str = "unknown"  # 종료 시 전·후진 주차 방향을 기록합니다.
+    final_speed: float = 0.0            # 정차 여부 판단을 위해 마지막 속도를 저장합니다.
 
 # ----------------- 모델/차량 -----------------
 def step_kinematic(state: State, delta, a, P: Params):
@@ -574,28 +576,54 @@ def draw_car(surface, state: State, delta, P: Params, world, sw, sh):
 
 # ----------------- 맵 로드 -----------------
 class MapAssets:
+    """MATLAB에서 추출한 주차장 맵 레이어를 한 묶음으로 관리합니다."""
+
     def __init__(self, C, Cs, Cm, Cp, cellSize, extent, slots, occupied_idx, border, lines, FreeThr, OccThr, walls_rects):
-        self.C=C; self.Cs=Cs; self.Cm=Cm; self.Cp=Cp
-        self.cellSize=cellSize; self.extent=extent
-        self.slots=slots; self.occupied_idx=occupied_idx
-        self.border=border; self.lines=lines
-        self.FreeThr=FreeThr; self.OccThr=OccThr
-        self.walls_rects=walls_rects
+        # 종합 비용맵을 유지합니다. (디버그용으로만 사용합니다.)
+        self.C = C
+        # 정지 물체 레이어를 보관합니다. (stationary grid로 학생에게 전달됩니다.)
+        self.Cs = Cs
+        # 차선/노면 마킹 레이어입니다.
+        self.Cm = Cm
+        # 주차 중인 차량 레이어입니다.
+        self.Cp = Cp
+        # 셀 해상도(미터)를 기억합니다.
+        self.cellSize = cellSize
+        # 월드 좌표 영역 [xmin, xmax, ymin, ymax]을 보관합니다.
+        self.extent = extent
+        # 슬롯 경계(Nx4)를 저장합니다.
+        self.slots = slots
+        # 슬롯 점유 여부(bool 배열)를 유지합니다.
+        self.occupied_idx = occupied_idx
+        # 외곽 경계를 직사각형으로 보관합니다.
+        self.border = border
+        # 차선 선분(x1, y1, x2, y2)을 유지합니다.
+        self.lines = lines
+        # 자유/점유 판정 임계를 저장합니다.
+        self.FreeThr = FreeThr
+        self.OccThr = OccThr
+        # 충돌 판정용 직사각형(벽·슬롯 등)을 보관합니다.
+        self.walls_rects = walls_rects
 
 def load_parking_assets(mat_path="parking_assets_layers_75x50.mat") -> MapAssets:
+    """MATLAB `.mat` 파일을 읽어 MapAssets 인스턴스를 구성합니다."""
     m = loadmat(mat_path)
-    C  = m["C"].astype(np.float32)                      # combined cost map
-    Cs = m["C_stationary"].astype(np.float32)           # stationary
-    Cm = m["C_markings"].astype(np.float32)             # road markings
-    Cp = m["C_parked"].astype(np.float32)               # parked cars
+    # MATLAB double을 float32로 변환하여 메모리 사용량을 줄입니다.
+    C = m["C"].astype(np.float32)
+    Cs = m["C_stationary"].astype(np.float32)
+    Cm = m["C_markings"].astype(np.float32)
+    Cp = m["C_parked"].astype(np.float32)
+    # 단일 값들은 squeeze 후 float으로 변환합니다.
     cellSize = float(np.array(m["cellSize"]).squeeze())
-    extent = tuple(np.array(m["extent"]).squeeze().tolist())  # (xmin,xmax,ymin,ymax)
-    slots = np.array(m["slots"]).astype(float)                 # Nx4 [xmin xmax ymin ymax]
+    extent = tuple(np.array(m["extent"]).squeeze().tolist())
+    # 슬롯, 선분 등은 float 배열 형태를 유지합니다.
+    slots = np.array(m["slots"]).astype(float)
     occupied_idx = np.array(m["occupied_idx"]).astype(bool).ravel()
-    border = tuple(np.array(m["border"]).squeeze().tolist())   # (xmin,xmax,ymin,ymax)
-    lines  = np.array(m["lines"]).astype(float)                # Mx4 [x1 y1 x2 y2]
+    border = tuple(np.array(m["border"]).squeeze().tolist())
+    lines = np.array(m["lines"]).astype(float)
+    # 점유 임계값은 float으로 보존합니다.
     FreeThr = float(np.array(m["FreeThreshold"]).squeeze())
-    OccThr  = float(np.array(m["OccupiedThreshold"]).squeeze())
+    OccThr = float(np.array(m["OccupiedThreshold"]).squeeze())
     walls_rects = np.array(m["walls_rects"]).astype(float)
     return MapAssets(C, Cs, Cm, Cp, cellSize, extent, slots, occupied_idx,
                      border, lines, FreeThr, OccThr, walls_rects)
@@ -621,6 +649,7 @@ def grid_cell_rect(row: int, col: int, extent, cellSize, H):
     return xmin, xmax, ymin, ymax
 
 def get_base_map(filename: str) -> MapAssets:
+    """원본 `.mat`을 로드하거나 캐시에서 꺼내 재사용합니다."""
     if filename not in BASE_MAP_CACHE:
         BASE_MAP_CACHE[filename] = load_parking_assets(filename)
     return BASE_MAP_CACHE[filename]
@@ -746,7 +775,7 @@ def scale_map_geometry(M: MapAssets, factor: float) -> None:
     M.cellSize *= factor
 
 def resize_slots_to_vehicle(M: MapAssets) -> None:
-    """슬롯 크기를 차량 크기에 맞춰 보정한다."""
+    """슬롯 중심을 유지한 채 차량 제원에 맞는 마진을 적용해 크기를 보정합니다."""
     if M.slots.size == 0:
         return
 
@@ -764,7 +793,7 @@ def resize_slots_to_vehicle(M: MapAssets) -> None:
 
 
 def open_top_parking_lane(M: MapAssets, tolerance: float = 0.25) -> None:
-    """상단 주차장 라인을 제거해 위쪽 통로를 개방한다."""
+    """상단 주차장 라인을 제거하여 진입 통로를 확보합니다."""
     top = float(M.extent[3])
     if M.lines.size > 0:
         keep_lines = []
@@ -788,7 +817,7 @@ def open_top_parking_lane(M: MapAssets, tolerance: float = 0.25) -> None:
         M.lines = np.array(keep_lines, dtype=float) if keep_lines else np.zeros((0, 4), dtype=float)
 
 def compute_line_rects(M: MapAssets, half_width: float = LINE_COLLISION_HALF_WIDTH) -> np.ndarray:
-    """슬롯 라인을 충돌 판정을 위해 얇은 직사각형으로 변환."""
+    """슬롯 라인을 충돌 판정을 위해 얇은 직사각형 버퍼로 변환합니다."""
     if M.lines.size == 0:
         return np.zeros((0, 4), dtype=float)
     rects = []
@@ -915,6 +944,9 @@ AVAILABLE_MAPS = [
     },
 ]
 
+# 스테이지별 점수 기준과 패널티 가중치를 정의합니다.
+# safe_base는 기본 안전 점수, weights는 항목별 패널티 비중을 뜻합니다.
+# expected_orientation은 최종 주차 방향 요구 조건을 나타냅니다.
 STAGE_RULES = {
     1: {
         "label": "1단계",
@@ -1029,7 +1061,8 @@ def get_stage_profile(map_cfg: dict | None):
     return stage, profile
 
 def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: str, world_extent) -> tuple[float, dict]:
-    """라운드 종료 시 점수와 지표 상세를 계산한다."""
+    """라운드 종료 시 스테이지 규칙에 따라 점수를 산출하고 세부 지표를 제공합니다."""
+    # HUD와 리플레이 요약에 사용할 기초 지표를 먼저 정리합니다.
     details = {
         "elapsed": stats.elapsed,
         "distance": stats.distance,
@@ -1041,13 +1074,16 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
         "final_speed": stats.final_speed,
     }
 
+    # 성공하지 못한 경우에는 즉시 0점을 부여하고 세부 정보만 반환합니다.
     if result_reason != "success":
         details["score"] = 0.0
         return 0.0, details
 
+    # 맵 대각선 길이를 사용해 상대적인 주행 거리 목표를 계산합니다.
     xmin, xmax, ymin, ymax = world_extent
     diag = math.hypot(xmax - xmin, ymax - ymin)
 
+    # 스테이지 설정에서 목표값과 가중치를 추출합니다.
     time_target = stage_profile.get("time_target", 1.0)
     distance_factor = stage_profile.get("distance_factor", 1.0)
     distance_target = max(1e-6, diag * distance_factor)
@@ -1060,8 +1096,10 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     total_weight = stage_weight_sum(stage_profile)
 
     avg_speed = details["avg_speed"]
+    # 항목별 기여도(패널티 반영 전의 가중 점수)를 기록합니다.
     component_breakdown = {}
 
+    # 각 항목의 성취율을 0~1 범위로 계산하고 가중치를 곱합니다.
     time_score = smooth_ratio(stats.elapsed, time_target)
     component_breakdown["time"] = compute_weighted_score(time_score, weights.get("time", 0.0))
 
@@ -1071,25 +1109,30 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     turn_score = limited_ratio(stats.gear_switches, turn_target)
     component_breakdown["turn"] = compute_weighted_score(turn_score, weights.get("turn", 0.0))
 
+    # 평균 속도 달성도를 시간 대비 0~1 범위로 정규화합니다.
     speed_score = clamp(avg_speed / speed_target, 0.0, 1.0)
     component_breakdown["speed"] = compute_weighted_score(speed_score, weights.get("speed", 0.0))
 
     steer_flip_score = limited_ratio(stats.direction_flips, steer_flip_target)
     component_breakdown["steer_flip"] = compute_weighted_score(steer_flip_score, weights.get("steer_flip", 0.0))
 
+    # 슬롯 점유율과 정렬 방향을 통해 최종 주차 품질을 평가합니다.
     parking_iou_component = parking_iou_score(stats.final_iou)
     component_breakdown["parking_iou"] = compute_weighted_score(parking_iou_component, weights.get("parking_iou", 0.0))
 
     orientation_component = orientation_alignment_score(stats.final_orientation, expected_orientation)
     component_breakdown["parking_orientation"] = compute_weighted_score(orientation_component, weights.get("parking_orientation", 0.0))
 
+    # 최종 속도가 낮을수록 완전 정차로 간주하여 추가 가점을 부여합니다.
     stop_component = clamp(1.0 - stats.final_speed / 0.3, 0.0, 1.0)
     component_breakdown["parking_stop"] = compute_weighted_score(stop_component, weights.get("parking_stop", 0.0))
 
+    # 가중 패널티를 모두 합산하여 성능 점수를 계산합니다.
     performance_component = sum(component_breakdown.values())
     score_cap = safe_base + total_weight if total_weight > 0 else 100.0
     final_score = clamp(safe_base + performance_component, 0.0, score_cap)
 
+    # 세부 내역을 details에 삽입하여 HUD와 리플레이에서 활용합니다.
     details.update({
         "component_scores": component_breakdown,
         "safe_base": safe_base,
@@ -1127,10 +1170,36 @@ def save_replay_log(frames: list[dict], meta: dict) -> str | None:
         with open(path, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=False, indent=2)
         print(f"[replay] 저장 완료: {path}")
+        mirror_replay_to_student_dir(Path(path), payload)
         return path
     except Exception as exc:
         print(f"[replay] 저장 실패: {exc}")
         return None
+
+
+def mirror_replay_to_student_dir(src_path: Path, payload: dict) -> None:
+    """학생 알고리즘 저장소가 존재하면 동일한 리플레이를 복사한다."""
+
+    student_root = Path(__file__).resolve().parent.parent / "self-parking-user-algorithms"
+    if not student_root.exists():
+        print(f"[replay] 학생 알고리즘 경로 없음: {student_root}")
+        return
+
+    try:
+        target_dir = student_root / "student_replays"
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(f"[replay] 학생용 디렉터리 생성 실패: {exc}")
+        return
+
+    target_path = target_dir / src_path.name
+    try:
+        with open(target_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
+        # 학생 쪽 경로는 조용히 동기화하되, 필요 시 디버그용 로그만 남긴다.
+        print(f"[replay] 학생용 복사 완료: {target_path}")
+    except Exception as exc:
+        print(f"[replay] 학생용 복사 실패: {exc}")
 
 def load_replay_file(path: str) -> tuple[dict, list[dict]]:
     """리플레이 JSON 파일을 읽어 메타와 프레임 리스트를 반환한다."""
@@ -1148,6 +1217,8 @@ def load_replay_file(path: str) -> tuple[dict, list[dict]]:
     return meta, frames
 
 def build_map_payload(M: MapAssets) -> dict:
+    """학생 클라이언트에 전송할 수 있도록 맵 데이터를 JSON 직렬화 형태로 변환합니다."""
+    # numpy 배열을 list/스칼라로 변환하여 JSON 인코더가 처리할 수 있도록 합니다.
     return {
         "extent": [float(x) for x in M.extent],
         "cellSize": float(M.cellSize),
@@ -1162,23 +1233,29 @@ def build_map_payload(M: MapAssets) -> dict:
     }
 
 def ensure_map_loaded(map_cfg: dict, cache: dict, seed: int | None = None) -> dict:
-    """Load map variant (with optional random seed) and cache the result."""
+    """맵 구성을 불러와 파생 변형을 적용한 뒤 캐시합니다."""
     map_key = map_cfg.get("key", map_cfg["filename"])
     cache_key = (map_key, seed)
     if cache_key not in cache:
+        # 기본 맵을 불러옵니다. (같은 파일을 반복 로드하는 것을 방지합니다.)
         base = get_base_map(map_cfg["filename"])
         variant = map_cfg.get("variant", "")
         if variant:
+            # variant 문자열에 따라 슬롯/점유 정보를 수정합니다.
             assets = apply_map_variant(base, variant, seed)
         else:
             assets = copy.deepcopy(base)
+        # 차량 크기에 맞게 슬롯 경계값을 리사이즈합니다.
         resize_slots_to_vehicle(assets)
+        # 진입로를 열어 초기 진입이 막히지 않도록 조정합니다.
         open_top_parking_lane(assets)
         assets.line_rects = compute_line_rects(assets)
         seed_val = seed if seed is not None else 0
         target_rng = random.Random(seed_val ^ 0x5F3759DF)
         free_idx = np.where(~assets.occupied_idx)[0]
+        # 비어 있는 슬롯 중 하나를 타깃으로 선정합니다. (없으면 None으로 둡니다.)
         target_idx = int(target_rng.choice(free_idx.tolist())) if free_idx.size > 0 else None
+        # IPC 송신용 payload를 미리 구성하여 캐시에 함께 보관합니다.
         payload = build_map_payload(assets)
         payload["expected_orientation"] = map_cfg.get("expected_orientation")
         slots_total = int(len(assets.slots))
@@ -1951,30 +2028,34 @@ class IPCController:
         return self.sock is not None
 
     def send_obs(self, obs: dict):
-        """관측값 한 틱을 JSON 한 줄로 직렬화하여 송신."""
+        """관측값 한 틱을 JSON Lines 한 줄로 직렬화하여 송신합니다."""
         if not self.sock:
             raise ConnectionError("IPC send attempted without active connection")
         line = (json.dumps(obs, ensure_ascii=False) + "\n").encode()
         self.sock.sendall(line)
 
     def send_map(self, map_payload: dict):
+        """연결 직후 맵 정보를 `{"map": ...}` 형태로 한 줄 송신합니다."""
         if not self.sock:
             raise ConnectionError("IPC send attempted without active connection")
         message = {"map": map_payload}
+        # 모든 메시지는 JSON 문자열 뒤에 개행을 붙여 JSON Lines 형식으로 전송합니다.
         line = (json.dumps(message, ensure_ascii=False) + "\n").encode()
         self.sock.sendall(line)
 
     def recv_cmd(self) -> dict:
-        """학생 알고리즘이 보낸 명령 한 줄을 수신하고 표준화."""
+        """학생 알고리즘이 보낸 명령 한 줄을 수신하고 필수 키만 추려 표준화합니다."""
         if not self.sock:
             raise ConnectionError("IPC recv attempted without active connection")
         while b"\n" not in self.buf:
+            # 줄바꿈이 수신될 때까지 버퍼에 누적합니다.
             chunk = self.sock.recv(4096)
             if not chunk:
                 raise ConnectionError("IPC closed")
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
         msg = json.loads(line.decode())
+        # 기본값을 채워 넣어 planner가 누락된 키로 인해 실패하지 않도록 합니다.
         return {
             "steer": float(msg.get("steer", 0.0)),
             "accel": float(msg.get("accel", 0.0)),
