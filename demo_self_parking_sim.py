@@ -53,6 +53,10 @@ MARKER_COLORS = {
     "line": (30, 30, 30),
 }
 
+PARKING_SUCCESS_IOU = 0.30  # 최소 IoU 기준 (30%)을 만족해야 합격으로 간주
+# 주차 방향 판정에 사용할 최소 정렬 코사인 값 (약 ±48도)
+ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
+
 BASE_WINDOW_SIZE = (1600, 1000)
 MIN_WINDOW_SIZE = (1280, 800)
 SIDEBAR_WIDTH_RANGE = (360, 480)
@@ -366,6 +370,85 @@ def polys_intersect_SAT(polyA, polyB):
 def poly_intersects_rect(poly, rect):
     return polys_intersect_SAT(poly, poly_from_rect(rect))
 
+def polygon_area(poly: list[tuple[float, float]]) -> float:
+    """Shoelace area for simple polygons."""
+    if len(poly) < 3:
+        return 0.0
+    acc = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        acc += x1 * y2 - x2 * y1
+    return abs(acc) * 0.5
+
+def clip_polygon_with_rect(poly: list[tuple[float, float]], rect: tuple[float, float, float, float]) -> list[tuple[float, float]]:
+    """Sutherland–Hodgman clipping of polygon with axis-aligned rectangle."""
+    xmin, xmax, ymin, ymax = rect
+    if len(poly) < 3:
+        return []
+
+    def clip_edge(points, keep_fn, intersect_fn):
+        if not points:
+            return []
+        output = []
+        s = points[-1]
+        s_inside = keep_fn(s)
+        for e in points:
+            e_inside = keep_fn(e)
+            if e_inside:
+                if not s_inside:
+                    output.append(intersect_fn(s, e))
+                output.append(e)
+            elif s_inside:
+                output.append(intersect_fn(s, e))
+            s, s_inside = e, e_inside
+        return output
+
+    def intersect_vertical(s, e, x_bound):
+        sx, sy = s
+        ex, ey = e
+        if abs(ex - sx) < 1e-9:
+            return x_bound, sy
+        t = (x_bound - sx) / (ex - sx)
+        return x_bound, sy + t * (ey - sy)
+
+    def intersect_horizontal(s, e, y_bound):
+        sx, sy = s
+        ex, ey = e
+        if abs(ey - sy) < 1e-9:
+            return sx, y_bound
+        t = (y_bound - sy) / (ey - sy)
+        return sx + t * (ex - sx), y_bound
+
+    points = poly
+    points = clip_edge(points, lambda p: p[0] >= xmin, lambda s, e: intersect_vertical(s, e, xmin))
+    points = clip_edge(points, lambda p: p[0] <= xmax, lambda s, e: intersect_vertical(s, e, xmax))
+    points = clip_edge(points, lambda p: p[1] >= ymin, lambda s, e: intersect_horizontal(s, e, ymin))
+    points = clip_edge(points, lambda p: p[1] <= ymax, lambda s, e: intersect_horizontal(s, e, ymax))
+    return points
+
+def compute_slot_iou(car_poly: list[tuple[float, float]], slot_rect: tuple[float, float, float, float]) -> float:
+    """Compute IoU between the car polygon and an axis-aligned slot rectangle."""
+    intersection_poly = clip_polygon_with_rect(car_poly, slot_rect)
+    inter_area = polygon_area(intersection_poly)
+    if inter_area <= 0.0:
+        return 0.0
+    car_area = polygon_area(car_poly)
+    xmin, xmax, ymin, ymax = slot_rect
+    slot_area = max(0.0, (xmax - xmin) * (ymax - ymin))
+    union_area = max(car_area + slot_area - inter_area, 1e-9)
+    return inter_area / union_area
+
+def determine_parking_orientation(state: "State", slot_rect: tuple[float, float, float, float]) -> str:
+    """Return 'front_in' or 'rear_in' depending on vehicle heading relative to slot."""
+    width = slot_rect[1] - slot_rect[0]
+    height = slot_rect[3] - slot_rect[2]
+    forward_vec = (math.cos(state.yaw), math.sin(state.yaw))
+    axis_value = forward_vec[1] if height >= width else forward_vec[0]
+    if abs(axis_value) < ORIENTATION_ALIGNMENT_THRESHOLD:
+        return "unknown"
+    return "front_in" if axis_value >= 0 else "rear_in"
+
 def perimeter_points(poly, spacing=0.10):
     """Sample points uniformly along polygon perimeter (meters)."""
     pts = []
@@ -448,6 +531,9 @@ class RoundStats:
     direction_flips: int = 0
     prev_gear: str = "D"
     prev_delta_sign: int = 0
+    final_iou: float = 0.0
+    final_orientation: str = "unknown"
+    final_speed: float = 0.0
 
 # ----------------- 모델/차량 -----------------
 def step_kinematic(state: State, delta, a, P: Params):
@@ -807,6 +893,7 @@ AVAILABLE_MAPS = [
         "summary": "균일한 배치의 표준 테스트 환경",
         "variant": "",
         "stage": 1,
+        "expected_orientation": "front_in",
     },
     {
         "key": "dense_lot",
@@ -815,6 +902,7 @@ AVAILABLE_MAPS = [
         "summary": "주변 슬롯이 가득 찬 협소 환경",
         "variant": "dense_center",
         "stage": 2,
+        "expected_orientation": "front_in",
     },
     {
         "key": "training_course",
@@ -823,59 +911,115 @@ AVAILABLE_MAPS = [
         "summary": "주차 슬롯 한 칸만 비어 있는 극한 환경",
         "variant": "single_free_slot",
         "stage": 3,
+        "expected_orientation": "rear_in",
     },
 ]
 
 STAGE_RULES = {
     1: {
         "label": "1단계",
-        "base_score": 100.0,
-        "time_target": 60.0,
-        "distance_factor": 0.85,
-        "turn_target": 2,
-        "speed_target": 2.5,
+        "safe_base": 55.0,
+        "time_target": 65.0,
+        "distance_factor": 0.90,
+        "turn_target": 3,
+        "speed_target": 2.0,
         "steer_flip_target": 4,
+        "expected_orientation": "front_in",
         "weights": {
-            "time": 30.0,
-            "distance": 30.0,
-            "turn": 20.0,
-            "speed": 10.0,
-            "steer_flip": 10.0,
+            "time": 8.0,
+            "distance": 6.0,
+            "turn": 5.0,
+            "speed": 5.0,
+            "steer_flip": 4.0,
+            "parking_iou": 9.0,
+            "parking_orientation": 5.0,
+            "parking_stop": 3.0,
         },
     },
     2: {
         "label": "2단계",
-        "base_score": 100.0,
-        "time_target": 75.0,
+        "safe_base": 50.0,
+        "time_target": 80.0,
         "distance_factor": 0.95,
         "turn_target": 3,
-        "speed_target": 3.0,
+        "speed_target": 2.8,
         "steer_flip_target": 5,
+        "expected_orientation": "front_in",
         "weights": {
-            "time": 28.0,
-            "distance": 28.0,
-            "turn": 22.0,
-            "speed": 12.0,
-            "steer_flip": 10.0,
+            "time": 9.0,
+            "distance": 6.0,
+            "turn": 6.0,
+            "speed": 6.0,
+            "steer_flip": 5.0,
+            "parking_iou": 9.0,
+            "parking_orientation": 6.0,
+            "parking_stop": 3.0,
         },
     },
     3: {
         "label": "3단계",
-        "base_score": 100.0,
-        "time_target": 90.0,
+        "safe_base": 45.0,
+        "time_target": 95.0,
         "distance_factor": 1.05,
         "turn_target": 4,
-        "speed_target": 3.5,
+        "speed_target": 3.2,
         "steer_flip_target": 6,
+        "expected_orientation": "rear_in",
         "weights": {
-            "time": 26.0,
-            "distance": 28.0,
-            "turn": 24.0,
-            "speed": 12.0,
-            "steer_flip": 10.0,
+            "time": 11.0,
+            "distance": 7.0,
+            "turn": 6.0,
+            "speed": 6.0,
+            "steer_flip": 5.0,
+            "parking_iou": 10.0,
+            "parking_orientation": 7.0,
+            "parking_stop": 3.0,
         },
     },
 }
+
+def stage_weight_sum(stage_profile: dict) -> float:
+    weights = stage_profile.get("weights", {})
+    return sum(float(v) for v in weights.values())
+
+def compute_weighted_score(component_score: float, weight: float) -> float:
+    return clamp(component_score, 0.0, 1.0) * weight
+
+def orientation_alignment_score(observed: str, expected: str) -> float:
+    if not expected:
+        return 1.0
+    if observed == expected:
+        return 1.0
+    if observed == "unknown":
+        return 0.25
+    # wrong orientation still gets small partial credit to avoid zeroing
+    return 0.0
+
+def parking_iou_score(final_iou: float) -> float:
+    if final_iou <= 0.0:
+        return 0.0
+    if final_iou >= 1.0:
+        return 1.0
+    span = max(1e-6, 1.0 - PARKING_SUCCESS_IOU)
+    return clamp((final_iou - PARKING_SUCCESS_IOU) / span + 0.5, 0.0, 1.0)
+
+def smooth_ratio(actual: float, target: float) -> float:
+    if target <= 1e-6:
+        return 1.0
+    if actual <= 0.0:
+        return 1.0
+    return clamp(target / actual, 0.0, 1.0)
+
+def inverse_ratio(actual: float, target: float) -> float:
+    if target <= 1e-6:
+        return 1.0
+    return clamp(target / max(actual, 1e-6), 0.0, 1.0)
+
+def limited_ratio(actual: float, target: float) -> float:
+    if target <= 1e-6:
+        return 1.0
+    return clamp(1.0 - (actual / (target * 2.0)), 0.0, 1.0)
+
 
 def get_stage_profile(map_cfg: dict | None):
     if not map_cfg:
@@ -892,6 +1036,9 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
         "gear_switches": stats.gear_switches,
         "avg_speed": (stats.avg_speed_accum / stats.speed_samples) if stats.speed_samples > 0 else 0.0,
         "reason": result_reason,
+        "parking_iou": stats.final_iou,
+        "parking_orientation": stats.final_orientation,
+        "final_speed": stats.final_speed,
     }
 
     if result_reason != "success":
@@ -907,42 +1054,50 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     turn_target = max(1, int(stage_profile.get("turn_target", 1)))
     speed_target = max(1e-6, float(stage_profile.get("speed_target", 1.0)))
     steer_flip_target = max(1, int(stage_profile.get("steer_flip_target", 1)))
+    expected_orientation = stage_profile.get("expected_orientation")
     weights = stage_profile.get("weights", {})
+    safe_base = float(stage_profile.get("safe_base", 40.0))
+    total_weight = stage_weight_sum(stage_profile)
 
-    time_ratio = stats.elapsed / time_target if time_target > 0 else 0.0
-    dist_ratio = stats.distance / distance_target
-    turn_ratio = stats.gear_switches / turn_target
     avg_speed = details["avg_speed"]
-    speed_ratio = avg_speed / speed_target
-    steer_flip_ratio = stats.direction_flips / steer_flip_target
+    component_breakdown = {}
 
-    penalties = (
-        weights.get("time", 0.0) * clamp(time_ratio, 0.0, 2.0) +
-        weights.get("distance", 0.0) * clamp(dist_ratio, 0.0, 2.0) +
-        weights.get("turn", 0.0) * clamp(turn_ratio, 0.0, 2.0) +
-        weights.get("speed", 0.0) * clamp(speed_ratio, 0.0, 2.0) +
-        weights.get("steer_flip", 0.0) * clamp(steer_flip_ratio, 0.0, 2.0)
-    )
+    time_score = smooth_ratio(stats.elapsed, time_target)
+    component_breakdown["time"] = compute_weighted_score(time_score, weights.get("time", 0.0))
 
-    base_score = stage_profile.get("base_score", 100.0)
-    metric_score = clamp(base_score - penalties, 0.0, base_score)
-    safe_base = 50.0
-    bonus_band = max(0.0, 100.0 - safe_base)
-    ratio = (metric_score / base_score) if base_score > 1e-6 else 0.0
-    performance_component = bonus_band * clamp(ratio, 0.0, 1.0)
-    final_score = clamp(safe_base + performance_component, 0.0, safe_base + bonus_band)
+    distance_score = inverse_ratio(stats.distance, distance_target)
+    component_breakdown["distance"] = compute_weighted_score(distance_score, weights.get("distance", 0.0))
+
+    turn_score = limited_ratio(stats.gear_switches, turn_target)
+    component_breakdown["turn"] = compute_weighted_score(turn_score, weights.get("turn", 0.0))
+
+    speed_score = clamp(avg_speed / speed_target, 0.0, 1.0)
+    component_breakdown["speed"] = compute_weighted_score(speed_score, weights.get("speed", 0.0))
+
+    steer_flip_score = limited_ratio(stats.direction_flips, steer_flip_target)
+    component_breakdown["steer_flip"] = compute_weighted_score(steer_flip_score, weights.get("steer_flip", 0.0))
+
+    parking_iou_component = parking_iou_score(stats.final_iou)
+    component_breakdown["parking_iou"] = compute_weighted_score(parking_iou_component, weights.get("parking_iou", 0.0))
+
+    orientation_component = orientation_alignment_score(stats.final_orientation, expected_orientation)
+    component_breakdown["parking_orientation"] = compute_weighted_score(orientation_component, weights.get("parking_orientation", 0.0))
+
+    stop_component = clamp(1.0 - stats.final_speed / 0.3, 0.0, 1.0)
+    component_breakdown["parking_stop"] = compute_weighted_score(stop_component, weights.get("parking_stop", 0.0))
+
+    performance_component = sum(component_breakdown.values())
+    score_cap = safe_base + total_weight if total_weight > 0 else 100.0
+    final_score = clamp(safe_base + performance_component, 0.0, score_cap)
 
     details.update({
-        "time_ratio": time_ratio,
-        "dist_ratio": dist_ratio,
-        "turn_ratio": turn_ratio,
-        "speed_ratio": speed_ratio,
-        "steer_flip_ratio": steer_flip_ratio,
-        "steer_flip_target": steer_flip_target,
-        "metric_score": metric_score,
-        "performance_component": performance_component,
+        "component_scores": component_breakdown,
         "safe_base": safe_base,
+        "performance_component": performance_component,
         "score": final_score,
+        "expected_orientation": expected_orientation,
+        "weight_total": total_weight,
+        "score_cap": score_cap,
     })
     return final_score, details
 
@@ -1025,6 +1180,7 @@ def ensure_map_loaded(map_cfg: dict, cache: dict, seed: int | None = None) -> di
         free_idx = np.where(~assets.occupied_idx)[0]
         target_idx = int(target_rng.choice(free_idx.tolist())) if free_idx.size > 0 else None
         payload = build_map_payload(assets)
+        payload["expected_orientation"] = map_cfg.get("expected_orientation")
         slots_total = int(len(assets.slots))
         occupied = int(np.count_nonzero(assets.occupied_idx))
         thumbnail = generate_map_thumbnail(assets, highlight_idx=target_idx)
@@ -2382,6 +2538,13 @@ def main():
 
                 # 차량 폴리곤(충돌용)
                 car_poly = car_polygon(state, P)
+                # 차량이 슬롯을 얼마나 채웠는지(IoU)와 진입 방향(전면/후면)을 계산한다.
+                slot_iou = compute_slot_iou(car_poly, target_slot)
+                slot_orientation = determine_parking_orientation(state, target_slot)
+                if slot_iou > round_stats.final_iou:
+                    round_stats.final_iou = slot_iou
+                    round_stats.final_orientation = slot_orientation
+                    round_stats.final_speed = abs(state.v)
 
                 # -------- 충돌 판정 --------
                 collided = False
@@ -2435,7 +2598,12 @@ def main():
                     collision_marker = None
 
                 # 성공 판정(간단 버전): 슬롯 완전 포함 + 저속
-                reached = rect_contains_poly(target_slot, car_poly) and abs(state.v) <= 0.2
+                # IoU 50% 이상 + 속도 저속 + 정해진 방향(전/후면)으로 정렬된 경우에만 성공 처리
+                reached = (
+                    slot_iou >= PARKING_SUCCESS_IOU
+                    and abs(state.v) <= 0.2
+                    and slot_orientation != "unknown"
+                )
 
                 if collided:
                     collision_markers.append({
@@ -2446,6 +2614,9 @@ def main():
                     why = "collision"
                     break
                 if reached:
+                    round_stats.final_iou = slot_iou
+                    round_stats.final_orientation = slot_orientation
+                    round_stats.final_speed = abs(state.v)
                     why = "success"
                     break
 
@@ -2559,8 +2730,9 @@ def main():
                 if t >= P.timeout:
                     why = "timeout"
                     break
-                round_stats.elapsed = t
-                round_stats.distance = move_dist
+            round_stats.elapsed = t
+            round_stats.distance = move_dist
+            round_stats.final_speed = max(round_stats.final_speed, abs(state.v))
 
         if why == "to_menu" or abort_to_menu:
             ui_mode = "map_select"
@@ -2573,6 +2745,7 @@ def main():
 
         round_stats.elapsed = t
         round_stats.distance = move_dist
+        round_stats.final_speed = max(round_stats.final_speed, abs(state.v))
         stage_idx, stage_profile = get_stage_profile(active_map_cfg)
         score_value, score_details = compute_round_score(round_stats, stage_profile, why, M.extent)
         RECENT_RESULTS.append({
@@ -2608,6 +2781,10 @@ def main():
                 "distance": round_stats.distance,
                 "gear_switches": round_stats.gear_switches,
                 "avg_speed": score_details.get("avg_speed"),
+                "parking_iou": round_stats.final_iou,
+                "parking_orientation": round_stats.final_orientation,
+                "parking_iou_threshold": PARKING_SUCCESS_IOU,
+                "expected_orientation": stage_profile.get("expected_orientation"),
             },
             "frame_count": len(replay_frames),
         }
@@ -2636,8 +2813,9 @@ def main():
         title = "SUCCESS" if why == "success" else ("TIMEOUT" if why == "timeout" else "COLLISION" if why == "collision" else "QUIT")
         stage_label = stage_profile.get("label", f"{stage_idx}단계")
         avg_speed = score_details.get("avg_speed", 0.0)
+        score_cap = score_details.get("score_cap", 100.0)
         info_lines = []
-        info_lines.append(f"총점 {score_value:.1f} / 100")
+        info_lines.append(f"총점 {score_value:.1f} / {score_cap:.0f}")
         if why == "success":
             perf = score_details.get("performance_component", 0.0)
             safe_base = score_details.get("safe_base", 50.0)
@@ -2651,6 +2829,40 @@ def main():
         info_lines.append(f"기어 전환 {round_stats.gear_switches}회")
         info_lines.append(f"충돌 {collision_count}회")
         info_lines.append(f"조향 방향 전환 {round_stats.direction_flips}회")
+        orientation_label = {
+            "front_in": "전면 주차",
+            "rear_in": "후면 주차",
+            "unknown": "방향 불확실",
+        }.get(round_stats.final_orientation, round_stats.final_orientation or "방향 불확실")
+        info_lines.append(f"주차 방향 {orientation_label}")
+        expected_orientation = stage_profile.get("expected_orientation")
+        if expected_orientation:
+            expected_label = {
+                "front_in": "전면 요구",
+                "rear_in": "후면 요구",
+            }.get(expected_orientation, expected_orientation)
+            info_lines.append(f"요구 방향 {expected_label}")
+        info_lines.append(f"IoU {round_stats.final_iou * 100:.1f}% / 기준 {PARKING_SUCCESS_IOU * 100:.0f}%")
+        info_lines.append(f"정지 속도 {round_stats.final_speed:.2f}m/s")
+
+        component_scores = score_details.get("component_scores", {}) or {}
+        if component_scores:
+            info_lines.append("")
+            info_lines.append("세부 점수")
+            component_labels = {
+                "time": "시간",
+                "distance": "이동 거리",
+                "turn": "기어 전환",
+                "speed": "평균 속도",
+                "steer_flip": "조향 전환",
+                "parking_iou": "슬롯 적합도",
+                "parking_orientation": "방향 일치",
+                "parking_stop": "종료 정지",
+            }
+            for key, value in component_scores.items():
+                label = component_labels.get(key, key)
+                weight = stage_profile.get("weights", {}).get(key, 0.0)
+                info_lines.append(f"- {label}: {value:.1f} / {weight:.0f}")
 
         if why == "success":
             xmin, xmax, ymin, ymax = M.extent
@@ -2693,6 +2905,28 @@ def main():
                 label = entry.get("stage_label", "")
                 reason_text = reason_map.get(entry.get("reason"), entry.get("reason", ""))
                 info_lines.append(f"- {label} {entry.get('map', '')}: {entry.get('score', 0.0):.1f}점 ({reason_text})")
+                details = entry.get("details", {}) or {}
+                iou = details.get("parking_iou")
+                orientation = details.get("parking_orientation")
+                expected = details.get("expected_orientation")
+                final_speed = details.get("final_speed")
+                if isinstance(iou, (int, float)):
+                    info_lines.append(f"    · IoU {iou * 100:.1f}%")
+                if orientation:
+                    orientation_label = {
+                        "front_in": "전면",
+                        "rear_in": "후면",
+                        "unknown": "불확실",
+                    }.get(orientation, orientation)
+                    info_lines.append(f"    · 방향 {orientation_label}")
+                if expected:
+                    expected_label = {
+                        "front_in": "요구 전면",
+                        "rear_in": "요구 후면",
+                    }.get(expected, expected)
+                    info_lines.append(f"    · {expected_label}")
+                if isinstance(final_speed, (int, float)):
+                    info_lines.append(f"    · 정지 속도 {final_speed:.2f}m/s")
 
         draw_overlay(screen, title, info_lines, font, sw, sh)
         pygame.display.flip()
