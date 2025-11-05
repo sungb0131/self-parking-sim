@@ -3,3 +3,5 @@ __pycache__/
 parking-agent/
 .venv/
 .DS_Store
+replays/
+student_replays/
