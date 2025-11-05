@@ -15,6 +15,7 @@ from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict
 
 import numpy as np
 import pygame
@@ -70,6 +71,28 @@ HIGHLIGHT_ALPHA = 80
 STEER_FLIP_DEADZONE = math.radians(2.0)
 MIN_TARGET_DISTANCE = 8.0  # meters; ensure target slot not adjacent to start
 LEFT_EXCLUDE_MARGIN = 6.0  # meters; ignore slots hugging the left wall
+
+
+def build_obs_payload(t: float, state, target_slot, params) -> Dict[str, Any]:
+    """주행 상태를 학생 에이전트/리플레이용 관측으로 변환."""
+    return {
+        "t": t,
+        "state": {
+            "x": float(state.x),
+            "y": float(state.y),
+            "yaw": float(state.yaw),
+            "v": float(state.v),
+        },
+        "target_slot": list(map(float, target_slot)),
+        "limits": {
+            "dt": float(params.dt),
+            "L": float(params.L),
+            "maxSteer": float(params.maxSteer),
+            "maxAccel": float(params.maxAccel),
+            "maxBrake": float(params.maxBrake),
+            "steerRate": float(params.steerRate),
+        },
+    }
 
 
 def enforce_min_window_size(width: int, height: int) -> tuple[int, int]:
@@ -2528,6 +2551,14 @@ def main():
                         u.accel = 0.0
                         u.brake = 1.0
                         u.delta_tgt = 0.0
+                    obs = build_obs_payload(t, state, target_slot, P)
+                    cmd_snapshot = {
+                        "steer": float(u.delta_tgt),
+                        "accel": float(u.accel),
+                        "brake": float(u.brake),
+                        "gear": u.gear,
+                    }
+                    replay_frames.append({"t": t, "obs": obs, "cmd": cmd_snapshot})
                 else:
                     u.delta_tgt = move_toward(u.delta_tgt, 0.0, P.selfCenterRate * P.dt)
                     u.accel = 0.0
@@ -2568,19 +2599,7 @@ def main():
                             continue
 
                     if not paused:
-                        obs = {
-                            "t": t,
-                            "state": {"x": state.x, "y": state.y, "yaw": state.yaw, "v": state.v},
-                            "target_slot": list(target_slot),
-                            "limits": {
-                                "dt": P.dt,
-                                "L": P.L,
-                                "maxSteer": P.maxSteer,
-                                "maxAccel": P.maxAccel,
-                                "maxBrake": P.maxBrake,
-                                "steerRate": P.steerRate,
-                            },
-                        }
+                        obs = build_obs_payload(t, state, target_slot, P)
                         replay_entry = {"t": t, "obs": obs, "cmd": None}
                         try:
                             ipc.send_obs(obs)
