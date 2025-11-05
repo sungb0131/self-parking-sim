@@ -1,14 +1,14 @@
-# demo_self_parking_sim.py — Self-Parking simulator (MATLAB 레이어 + SAT 충돌) + IPC 제어
-# 사용법:
-#   python demo_self_parking_sim.py                  # 기본: IPC 127.0.0.1:55555
+# demo_self_parking_sim.py — Self-parking simulator (MATLAB layers + SAT collisions) with IPC control
+# Usage:
+#   python demo_self_parking_sim.py                  # default: IPC 127.0.0.1:55555
 #   python demo_self_parking_sim.py --host 127.0.0.1 --port 55556
-#   python demo_self_parking_sim.py --mode wasd      # (디버그용) 키보드 제어
+#   python demo_self_parking_sim.py --mode wasd      # (debug) keyboard drive mode
 
 from __future__ import annotations
 
 import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "0")  # macOS IME 노이즈 억제
+os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "0")  # suppress macOS IME popups
 
 import argparse, errno, json, math, random, socket, copy, subprocess, sys
 from datetime import datetime
@@ -31,7 +31,7 @@ FONT_CANDIDATES = [
 
 
 def load_font_with_fallback(size: int, bold: bool = False):
-    """한국어를 포함한 텍스트가 깨지지 않도록 다단계로 폰트를 탐색."""
+    """Search through multiple font families so localized text renders cleanly."""
     font_path = None
     for group in FONT_CANDIDATES:
         font_path = pygame.font.match_font(group, bold=bold)
@@ -56,8 +56,8 @@ MARKER_COLORS = {
     "line": (30, 30, 30),
 }
 
-PARKING_SUCCESS_IOU = 0.30  # 최소 IoU 기준 (30%)을 만족해야 합격으로 간주
-# 주차 방향 판정에 사용할 최소 정렬 코사인 값 (약 ±48도)
+PARKING_SUCCESS_IOU = 0.30  # minimum IoU threshold (30%) to consider a pass
+# Minimum alignment cosine (≈ ±48°) to treat the orientation as correct
 ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
 
 BASE_WINDOW_SIZE = (1480, 900)
@@ -75,7 +75,7 @@ LEFT_EXCLUDE_MARGIN = 6.0  # meters; ignore slots hugging the left wall
 
 
 def build_obs_payload(t: float, state, target_slot, params) -> Dict[str, Any]:
-    """주행 상태를 학생 에이전트/리플레이용 관측으로 변환."""
+    """Convert the runtime state into an observation payload for agents/replays."""
     return {
         "t": t,
         "state": {
@@ -102,7 +102,7 @@ def enforce_min_window_size(width: int, height: int) -> tuple[int, int]:
 
 
 def compute_layout(sw: int, sh: int) -> tuple[pygame.Rect, pygame.Rect]:
-    """화면 폭에 따라 메인 뷰와 사이드바 폭을 유연하게 조절한다."""
+    """Adjust main view and sidebar widths responsively to match the window."""
     base_width = BASE_WINDOW_SIZE[0]
     scale = clamp(sw / base_width, 0.65, 1.0)
 
@@ -243,7 +243,7 @@ def discover_agent_entries(base_dir: Path) -> list[dict]:
     local_agent = base_dir / "student_algorithms.py"
     if local_agent.exists():
         entries.append({
-            "label": "student_algorithms.py (로컬)",
+            "label": "student_algorithms.py (local)",
             "path": local_agent,
             "cwd": base_dir,
             "type": "process",
@@ -258,7 +258,7 @@ def discover_agent_entries(base_dir: Path) -> list[dict]:
             "type": "process",
         })
     entries.append({
-        "label": "내장 WASD 조작 (동일 PC)",
+        "label": "Built-in WASD control (this computer)",
         "path": None,
         "cwd": base_dir,
         "type": "local_manual",
@@ -267,13 +267,13 @@ def discover_agent_entries(base_dir: Path) -> list[dict]:
 
 
 class AgentManager:
-    """학생 알고리즘 프로세스를 관리한다."""
+    """Manage student algorithm subprocesses."""
 
     def __init__(self, entries: list[dict], python_executable: str | None = None):
         self.entries: list[dict] = []
         for entry in entries:
             self.entries.append({
-                "label": entry.get("label", "학생 알고리즘"),
+                "label": entry.get("label", "Student Algorithm"),
                 "path": Path(entry.get("path")) if entry.get("path") else None,
                 "cwd": Path(entry.get("cwd", Path.cwd())),
                 "type": entry.get("type", "process"),
@@ -297,11 +297,11 @@ class AgentManager:
 
     def start(self, idx: int, host: str, port: int) -> tuple[bool, str | None]:
         if idx < 0 or idx >= len(self.entries):
-            return False, "선택된 알고리즘이 없습니다."
+            return False, "No agent entry has been selected."
         entry = self.entries[idx]
         path_obj = entry["path"]
         if path_obj is not None and not path_obj.exists():
-            return False, "파일을 찾을 수 없습니다."
+            return False, "Agent file could not be found."
 
         self.stop()
         entry_type = entry.get("type", "process")
@@ -311,7 +311,7 @@ class AgentManager:
             return True, None
 
         if entry["path"] is None:
-            return False, "실행 가능한 파일이 없습니다."
+            return False, "No executable interpreter available for this agent."
 
         cmd = [self.python_executable, str(entry["path"]), "--host", host, "--port", str(port)]
         try:
@@ -532,7 +532,7 @@ def draw_overlay(surface, title, lines, font, sw, sh):
         surface.blit(img, (ox + 20, y))
         y += 22
 
-    tip = "R: 재시작  ·  M: 맵 변경  ·  ESC/Q: 종료"
+    tip = "R: restart  ·  M: change map  ·  ESC/Q: quit"
     tip_img = font.render(tip, True, (0, 0, 0))
     surface.blit(tip_img, (ox + 20, oy + ih - 32))
 
@@ -564,20 +564,20 @@ class InputCmd:
 
 @dataclass
 class RoundStats:
-    """라운드 동안 누적되는 주행 지표를 담습니다."""
+    """Accumulates driving metrics over a single simulation round."""
 
-    elapsed: float = 0.0          # 주행에 소요된 시간을 초 단위로 누적합니다.
-    distance: float = 0.0         # 이동 거리를 미터 단위로 누적합니다.
-    gear_switches: int = 0        # 기어 전환 횟수를 기록합니다.
-    avg_speed_accum: float = 0.0  # 평균 속도 계산을 위해 속도의 합을 누적합니다.
-    speed_samples: int = 0        # 속도 샘플 개수를 기록합니다.
-    min_abs_steer: float = float("inf")  # 주차 후 직각 정렬 여부를 판단하기 위해 최소 조향 각도를 기록합니다.
-    direction_flips: int = 0            # 전진↔후진 전환 횟수를 누적합니다.
-    prev_gear: str = "D"                # 전환 감지를 위해 직전 기어를 기억합니다.
-    prev_delta_sign: int = 0            # 조향 변경 횟수 세기를 위한 직전 각도 부호를 저장합니다.
-    final_iou: float = 0.0              # 종료 시 차량과 슬롯의 IoU를 기록합니다.
-    final_orientation: str = "unknown"  # 종료 시 전·후진 주차 방향을 기록합니다.
-    final_speed: float = 0.0            # 정차 여부 판단을 위해 마지막 속도를 저장합니다.
+    elapsed: float = 0.0          # elapsed driving time (seconds)
+    distance: float = 0.0         # total travel distance (meters)
+    gear_switches: int = 0        # number of gear changes
+    avg_speed_accum: float = 0.0  # sum of speeds for average computation
+    speed_samples: int = 0        # number of samples contributing to the average
+    min_abs_steer: float = float("inf")  # minimum absolute steering angle observed
+    direction_flips: int = 0            # count of direction changes (left/right)
+    prev_gear: str = "D"                # previous gear to detect transitions
+    prev_delta_sign: int = 0            # previous steer sign for flip detection
+    final_iou: float = 0.0              # IoU with the parking slot at completion
+    final_orientation: str = "unknown"  # final parking orientation label
+    final_speed: float = 0.0            # last recorded speed for stop validation
 
 # ----------------- 모델/차량 -----------------
 def step_kinematic(state: State, delta, a, P: Params):
@@ -616,54 +616,42 @@ def draw_car(surface, state: State, delta, P: Params, world, sw, sh):
     draw_polygon(surface, wl, (40,40,40), world, sw, sh, width=0)
     draw_polygon(surface, wr, (40,40,40), world, sw, sh, width=0)
 
-# ----------------- 맵 로드 -----------------
+# ----------------- Map loading -----------------
 class MapAssets:
-    """MATLAB에서 추출한 주차장 맵 레이어를 한 묶음으로 관리합니다."""
+    """Bundle layered parking-lot data extracted from MATLAB."""
 
     def __init__(self, C, Cs, Cm, Cp, cellSize, extent, slots, occupied_idx, border, lines, FreeThr, OccThr, walls_rects):
-        # 종합 비용맵을 유지합니다. (디버그용으로만 사용합니다.)
         self.C = C
-        # 정지 물체 레이어를 보관합니다. (stationary grid로 학생에게 전달됩니다.)
         self.Cs = Cs
-        # 차선/노면 마킹 레이어입니다.
         self.Cm = Cm
-        # 주차 중인 차량 레이어입니다.
         self.Cp = Cp
-        # 셀 해상도(미터)를 기억합니다.
         self.cellSize = cellSize
-        # 월드 좌표 영역 [xmin, xmax, ymin, ymax]을 보관합니다.
         self.extent = extent
-        # 슬롯 경계(Nx4)를 저장합니다.
         self.slots = slots
-        # 슬롯 점유 여부(bool 배열)를 유지합니다.
         self.occupied_idx = occupied_idx
-        # 외곽 경계를 직사각형으로 보관합니다.
         self.border = border
-        # 차선 선분(x1, y1, x2, y2)을 유지합니다.
         self.lines = lines
-        # 자유/점유 판정 임계를 저장합니다.
         self.FreeThr = FreeThr
         self.OccThr = OccThr
-        # 충돌 판정용 직사각형(벽·슬롯 등)을 보관합니다.
         self.walls_rects = walls_rects
 
 def load_parking_assets(mat_path="parking_assets_layers_75x50.mat") -> MapAssets:
-    """MATLAB `.mat` 파일을 읽어 MapAssets 인스턴스를 구성합니다."""
+    """Load layered assets from a MATLAB `.mat` file."""
     m = loadmat(mat_path)
-    # MATLAB double을 float32로 변환하여 메모리 사용량을 줄입니다.
+    # Convert MATLAB doubles to float32 to reduce memory usage.
     C = m["C"].astype(np.float32)
     Cs = m["C_stationary"].astype(np.float32)
     Cm = m["C_markings"].astype(np.float32)
     Cp = m["C_parked"].astype(np.float32)
-    # 단일 값들은 squeeze 후 float으로 변환합니다.
+    # Squeeze scalars to floats.
     cellSize = float(np.array(m["cellSize"]).squeeze())
     extent = tuple(np.array(m["extent"]).squeeze().tolist())
-    # 슬롯, 선분 등은 float 배열 형태를 유지합니다.
+    # Keep slots, lines, etc. as float arrays.
     slots = np.array(m["slots"]).astype(float)
     occupied_idx = np.array(m["occupied_idx"]).astype(bool).ravel()
     border = tuple(np.array(m["border"]).squeeze().tolist())
     lines = np.array(m["lines"]).astype(float)
-    # 점유 임계값은 float으로 보존합니다.
+    # Preserve occupancy thresholds as floats.
     FreeThr = float(np.array(m["FreeThreshold"]).squeeze())
     OccThr = float(np.array(m["OccupiedThreshold"]).squeeze())
     walls_rects = np.array(m["walls_rects"]).astype(float)
@@ -674,7 +662,7 @@ def world_to_rc(x, y, extent, cellSize, H):
     xmin,xmax,ymin,ymax = extent
     col = int(np.floor((x - xmin) / cellSize))
     row_from_bottom = int(np.floor((y - ymin) / cellSize))
-    row = H - 1 - row_from_bottom  # MATLAB행렬과 스크린 좌표 뒤집힘 보정
+    row = H - 1 - row_from_bottom  # compensate for MATLAB row ordering
     return row, col
 
 def draw_walls_rects(surface, world, sw, sh, rects):
@@ -691,13 +679,13 @@ def grid_cell_rect(row: int, col: int, extent, cellSize, H):
     return xmin, xmax, ymin, ymax
 
 def get_base_map(filename: str) -> MapAssets:
-    """원본 `.mat`을 로드하거나 캐시에서 꺼내 재사용합니다."""
+    """Load and cache the base `.mat` dataset."""
     if filename not in BASE_MAP_CACHE:
         BASE_MAP_CACHE[filename] = load_parking_assets(filename)
     return BASE_MAP_CACHE[filename]
 
 def generate_map_thumbnail(M: MapAssets, size=(280, 160), highlight_idx: int | None = None):
-    """맵 레이어를 소형 카드 형태로 미리 렌더링."""
+    """Render the map layers into a compact preview card."""
     width, height = size
     surface = pygame.Surface((width, height))
     surface.fill((248, 250, 255))
@@ -731,7 +719,7 @@ def generate_map_thumbnail(M: MapAssets, size=(280, 160), highlight_idx: int | N
         pygame.draw.polygon(surface, (180, 240, 190), pts)
         pygame.draw.lines(surface, (60, 140, 60), True, pts, 3)
 
-    # 벽체/라인 표현
+    # draw walls/line markings
     for r in M.walls_rects:
         pts = [to_screen(r[0], r[2]),
                to_screen(r[1], r[2]),
@@ -751,7 +739,7 @@ def generate_map_thumbnail(M: MapAssets, size=(280, 160), highlight_idx: int | N
     return surface
 
 def _ensure_at_least_one_free_slot(M: MapAssets, rng: random.Random) -> None:
-    """모든 슬롯이 점유된 경우 하나를 무작위로 비워 타깃을 선택할 수 있도록 보정."""
+    """Ensure at least one slot remains free by clearing one at random if needed."""
     if M.slots.size == 0:
         return
     if np.all(M.occupied_idx):
@@ -767,7 +755,7 @@ ENABLE_BOUNDARY_COLLISIONS = True
 LINE_COLLISION_HALF_WIDTH = 0.25
 
 def scale_map_geometry(M: MapAssets, factor: float) -> None:
-    """맵 전체를 중심 기준으로 축소/확대해 슬롯·경계를 일괄 조정."""
+    """Scale the map about its center, adjusting slots and boundaries."""
     if factor <= 0:
         return
 
@@ -817,7 +805,7 @@ def scale_map_geometry(M: MapAssets, factor: float) -> None:
     M.cellSize *= factor
 
 def resize_slots_to_vehicle(M: MapAssets) -> None:
-    """슬롯 중심을 유지한 채 차량 제원에 맞는 마진을 적용해 크기를 보정합니다."""
+    """Resize slots around their center with vehicle-friendly margins."""
     if M.slots.size == 0:
         return
 
@@ -835,7 +823,7 @@ def resize_slots_to_vehicle(M: MapAssets) -> None:
 
 
 def open_top_parking_lane(M: MapAssets, tolerance: float = 0.25) -> None:
-    """상단 주차장 라인을 제거하여 진입 통로를 확보합니다."""
+    """Remove the top boundary so the entry lane remains open."""
     top = float(M.extent[3])
     if M.lines.size > 0:
         keep_lines = []
@@ -859,7 +847,7 @@ def open_top_parking_lane(M: MapAssets, tolerance: float = 0.25) -> None:
         M.lines = np.array(keep_lines, dtype=float) if keep_lines else np.zeros((0, 4), dtype=float)
 
 def compute_line_rects(M: MapAssets, half_width: float = LINE_COLLISION_HALF_WIDTH) -> np.ndarray:
-    """슬롯 라인을 충돌 판정을 위해 얇은 직사각형 버퍼로 변환합니다."""
+    """Extrude lane lines into thin rectangles for collision testing."""
     if M.lines.size == 0:
         return np.zeros((0, 4), dtype=float)
     rects = []
@@ -891,7 +879,7 @@ def compute_line_rects(M: MapAssets, half_width: float = LINE_COLLISION_HALF_WID
 
 
 def apply_map_variant(base: MapAssets, variant: str, seed: int | None = None) -> MapAssets:
-    """기본 맵 자산에 변형을 적용해 다른 난이도/환경을 구성."""
+    """Apply variant tweaks on top of the base map to alter difficulty."""
     rng = random.Random(seed)
     M = copy.deepcopy(base)
 
@@ -959,38 +947,38 @@ def apply_map_variant(base: MapAssets, variant: str, seed: int | None = None) ->
 AVAILABLE_MAPS = [
     {
         "key": "default_lot",
-        "name": "기본 주차장 75x50",
+        "name": "Default Lot 75x50",
         "filename": "parking_assets_layers_75x50.mat",
-        "summary": "균일한 배치의 표준 테스트 환경",
+        "summary": "Balanced baseline environment",
         "variant": "",
         "stage": 1,
         "expected_orientation": "front_in",
     },
     {
         "key": "dense_lot",
-        "name": "혼잡 주차장",
+        "name": "Crowded Lot",
         "filename": "parking_assets_layers_75x50.mat",
-        "summary": "주변 슬롯이 가득 찬 협소 환경",
+        "summary": "Tight layout with occupied neighbors",
         "variant": "dense_center",
         "stage": 2,
         "expected_orientation": "front_in",
     },
     {
         "key": "training_course",
-        "name": "만석 주차장",
+        "name": "Full House Lot",
         "filename": "parking_assets_layers_75x50.mat",
-        "summary": "주차 슬롯 한 칸만 비어 있는 극한 환경",
+        "summary": "Only a single slot remains open",
         "variant": "single_free_slot",
         "stage": 3,
         "expected_orientation": "rear_in",
     },
 ]
 
-# 스테이지별 점수 기준과 패널티 가중치를 정의합니다.
-# weights는 항목별 패널티 비중을, expected_orientation은 최종 주차 방향 요구 조건을 나타냅니다.
+# Define per-stage scoring thresholds and penalty weights.
+# `weights` controls penalty importance and `expected_orientation` enforces the final parking heading.
 STAGE_RULES = {
     1: {
-        "label": "1단계",
+        "label": "Stage 1",
         "time_target": 65.0,
         "distance_factor": 0.90,
         "speed_target": 2.0,
@@ -1007,7 +995,7 @@ STAGE_RULES = {
         },
     },
     2: {
-        "label": "2단계",
+        "label": "Stage 2",
         "time_target": 80.0,
         "distance_factor": 0.95,
         "speed_target": 2.8,
@@ -1024,7 +1012,7 @@ STAGE_RULES = {
         },
     },
     3: {
-        "label": "3단계",
+        "label": "Stage 3",
         "time_target": 95.0,
         "distance_factor": 1.05,
         "speed_target": 3.2,
@@ -1043,20 +1031,20 @@ STAGE_RULES = {
 }
 
 ORIENTATION_LABELS = {
-    "front_in": "전면 주차",
-    "rear_in": "후면 주차",
+    "front_in": "Front-in parking",
+    "rear_in": "Rear-in parking",
 }
 
 
 ORIENTATION_LABELS_SHORT = {
-    "front_in": "전면",
-    "rear_in": "후면",
+    "front_in": "Front",
+    "rear_in": "Rear",
 }
 
 
 def describe_orientation(expected: str | None) -> str:
     if not expected:
-        return "방향 자유"
+        return "Orientation flexible"
     return ORIENTATION_LABELS.get(expected, expected)
 
 
@@ -1107,8 +1095,8 @@ def get_stage_profile(map_cfg: dict | None):
     return stage, profile
 
 def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: str, world_extent) -> tuple[float, dict]:
-    """라운드 종료 시 스테이지 규칙에 따라 점수를 산출하고 세부 지표를 제공합니다."""
-    # HUD와 리플레이 요약에 사용할 기초 지표를 먼저 정리합니다.
+    """Compute round scores based on stage rules and gather detailed metrics."""
+    # Prepare base metrics shared with the HUD and replay summaries.
     details = {
         "elapsed": stats.elapsed,
         "distance": stats.distance,
@@ -1193,13 +1181,13 @@ def _slugify(text: str) -> str:
     return slug or "session"
 
 def save_replay_log(frames: list[dict], meta: dict) -> str | None:
-    """IPC 통신 로그를 리플레이 파일로 저장한다."""
+    """Persist the IPC communication log as a replay file."""
     if not frames:
         return None
     try:
         os.makedirs(REPLAY_DIR, exist_ok=True)
     except Exception as exc:
-        print(f"[replay] 디렉터리 생성 실패: {exc}")
+        print(f"[replay] failed to create directory: {exc}")
         return None
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     map_label = _slugify(meta.get("map_key", meta.get("map_name", "session")))
@@ -1212,27 +1200,27 @@ def save_replay_log(frames: list[dict], meta: dict) -> str | None:
     try:
         with open(path, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=False, indent=2)
-        print(f"[replay] 저장 완료: {path}")
+        print(f"[replay] saved: {path}")
         mirror_replay_to_student_dir(Path(path), payload)
         return path
     except Exception as exc:
-        print(f"[replay] 저장 실패: {exc}")
+        print(f"[replay] failed to write: {exc}")
         return None
 
 
 def mirror_replay_to_student_dir(src_path: Path, payload: dict) -> None:
-    """학생 알고리즘 저장소가 존재하면 동일한 리플레이를 복사한다."""
+    """Copy the replay into the student-algorithm workspace when available."""
 
     student_root = Path(__file__).resolve().parent.parent / "self-parking-user-algorithms"
     if not student_root.exists():
-        print(f"[replay] 학생 알고리즘 경로 없음: {student_root}")
+        print(f"[replay] student workspace missing: {student_root}")
         return
 
     try:
         target_dir = student_root / "student_replays"
         target_dir.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
-        print(f"[replay] 학생용 디렉터리 생성 실패: {exc}")
+        print(f"[replay] failed to create student directory: {exc}")
         return
 
     target_path = target_dir / src_path.name
@@ -1240,28 +1228,28 @@ def mirror_replay_to_student_dir(src_path: Path, payload: dict) -> None:
         with open(target_path, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=False, indent=2)
         # 학생 쪽 경로는 조용히 동기화하되, 필요 시 디버그용 로그만 남긴다.
-        print(f"[replay] 학생용 복사 완료: {target_path}")
+        print(f"[replay] copied for student: {target_path}")
     except Exception as exc:
-        print(f"[replay] 학생용 복사 실패: {exc}")
+        print(f"[replay] failed to copy for student: {exc}")
 
 def load_replay_file(path: str) -> tuple[dict, list[dict]]:
-    """리플레이 JSON 파일을 읽어 메타와 프레임 리스트를 반환한다."""
+    """Load a replay JSON file and return metadata plus frames."""
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"리플레이 파일을 찾을 수 없습니다: {path}")
+        raise FileNotFoundError(f"Replay file not found: {path}")
     with open(path, "r", encoding="utf-8") as fp:
         try:
             data = json.load(fp)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"리플레이 파일이 손상되었습니다: {exc}") from exc
+            raise ValueError(f"Replay file corrupted: {exc}") from exc
     meta = data.get("meta", {})
     frames = data.get("frames", [])
     if not isinstance(frames, list) or not frames:
-        raise ValueError("리플레이 파일에 프레임 데이터가 없습니다.")
+        raise ValueError("Replay file has no frame data.")
     return meta, frames
 
 def build_map_payload(M: MapAssets) -> dict:
-    """학생 클라이언트에 전송할 수 있도록 맵 데이터를 JSON 직렬화 형태로 변환합니다."""
-    # numpy 배열을 list/스칼라로 변환하여 JSON 인코더가 처리할 수 있도록 합니다.
+    """Serialize map data so it can be delivered to the student client."""
+    # Convert numpy arrays to lists/scalars so JSON encoders can handle them.
     return {
         "extent": [float(x) for x in M.extent],
         "cellSize": float(M.cellSize),
@@ -1276,7 +1264,7 @@ def build_map_payload(M: MapAssets) -> dict:
     }
 
 def ensure_map_loaded(map_cfg: dict, cache: dict, seed: int | None = None) -> dict:
-    """맵 구성을 불러와 파생 변형을 적용한 뒤 캐시합니다."""
+    """Load a map configuration, apply any variants, and cache the result."""
     map_key = map_cfg.get("key", map_cfg["filename"])
     cache_key = (map_key, seed)
     if cache_key not in cache:
@@ -1318,7 +1306,7 @@ def ensure_map_loaded(map_cfg: dict, cache: dict, seed: int | None = None) -> di
     return cache[cache_key]
 
 def detect_stationary_collision(car_poly, M: MapAssets, threshold=0.5):
-    """정지물 레이어와 차량 폴리곤 충돌을 고해상도로 판정한다. [UPDATE] 기존 둘레 샘플링 대신 셀 교차 검사로 정확도를 높였다."""
+    """Perform high-resolution collision checks between the stationary grid and vehicle polygon."""
     H, W = M.Cs.shape
     car_x = [p[0] for p in car_poly]
     car_y = [p[1] for p in car_poly]
@@ -1348,7 +1336,7 @@ def detect_stationary_collision(car_poly, M: MapAssets, threshold=0.5):
     return False, None
 
 def draw_collision_markers(surface, markers, world, sw, sh):
-    """충돌 지점을 시각화한다. [UPDATE] 충돌 위치 확인을 위한 마커 추가."""
+    """Visualize collision impact points for debugging."""
     for marker in markers:
         mx, my = marker.get("pos", (None, None))
         if mx is None or my is None:
@@ -1368,7 +1356,7 @@ def draw_pause_overlay(
     stats_lines,
     instructions,
 ):
-    """일시정지 오버레이와 우측 패널을 렌더링."""
+    """Render the pause overlay together with the right-hand HUD panels."""
     dim = pygame.Surface((sw, sh), pygame.SRCALPHA)
     dim.fill((0, 0, 0, 140))
     screen.blit(dim, (0, 0))
@@ -1457,10 +1445,10 @@ def render_map_selection(
     main_rect, sidebar_rect = compute_layout(sw, sh)
     pygame.draw.rect(surface, (248, 250, 253), main_rect)
 
-    title_surface = fonts["title"].render("주행 맵 선택", True, (28, 34, 78))
+    title_surface = fonts["title"].render("Select Driving Map", True, (28, 34, 78))
     surface.blit(title_surface, (main_rect.x + (main_rect.width - title_surface.get_width()) // 2, 52))
 
-    subtitle_surface = fonts["regular"].render("연결 전에 사용할 주행 환경을 선택하세요.", True, (82, 92, 115))
+    subtitle_surface = fonts["regular"].render("Choose a course before connecting the agent.", True, (82, 92, 115))
     surface.blit(subtitle_surface, (main_rect.x + (main_rect.width - subtitle_surface.get_width()) // 2, 112))
 
     if connection_text:
@@ -1514,7 +1502,7 @@ def render_map_selection(
             surface.blit(overlay, rect.topleft)
 
         name_rect = pygame.Rect(rect.x + 20, rect.y + 16, rect.width - 40, 44)
-        draw_wrapped_text(surface, cfg.get("name", "맵"), fonts["large"], (24, 32, 60), name_rect, max_lines=1, ellipsis=True)
+        draw_wrapped_text(surface, cfg.get("name", "Map"), fonts["large"], (24, 32, 60), name_rect, max_lines=1, ellipsis=True)
 
         state = map_states.setdefault(cfg["key"], {"seed": random.randrange(1 << 30)})
         seed = state["seed"]
@@ -1525,9 +1513,9 @@ def render_map_selection(
             bundle = ensure_map_loaded(cfg, map_cache, seed=seed)
             preview = bundle.get("thumbnail")
         except FileNotFoundError:
-            preview_error = "맵 파일을 찾을 수 없습니다."
+            preview_error = "Map file not found."
         except Exception as exc:
-            preview_error = f"미리보기 실패: {exc}"
+            preview_error = f"Preview failed: {exc}"
 
         canvas_rect = pygame.Rect(rect.x + 16, rect.y + 70, rect.width - 32, int(thumbnail_height))
         pygame.draw.rect(surface, (232, 236, 248), canvas_rect, border_radius=12)
@@ -1561,7 +1549,7 @@ def render_map_selection(
 
         orientation_value = cfg.get("expected_orientation")
         orientation_label = describe_orientation(orientation_value)
-        requirement_prefix = "요구 방향"
+        requirement_prefix = "Required orientation"
         requirement_text = f"{requirement_prefix}: {orientation_label}"
         requirement_font = fonts["large"] if orientation_value else fonts["regular"]
         requirement_color = (44, 64, 128) if orientation_value else (96, 104, 132)
@@ -1583,7 +1571,7 @@ def render_map_selection(
 
         if bundle:
             meta = bundle.get("meta", {})
-            stats_text = f"전체 슬롯 {meta.get('slots_total', '?')}개 · 점유 {meta.get('occupied_total', '?')}개"
+            stats_text = f"Slots {meta.get('slots_total', '?')} · Occupied {meta.get('occupied_total', '?')}"
             stats_rect = pygame.Rect(rect.x + 20, stats_top, rect.width - 40, 24)
             draw_wrapped_text(surface, stats_text, fonts["regular"], (100, 110, 140), stats_rect, align="center", max_lines=1)
 
@@ -1591,16 +1579,16 @@ def render_map_selection(
         surface.blit(footer_surface, (rect.right - footer_surface.get_width() - 14, rect.bottom - footer_surface.get_height() - 10))
 
         if selected and focus_mode == "maps":
-            tag_surface = fonts["regular"].render("선택됨", True, (255, 255, 255))
+            tag_surface = fonts["regular"].render("Selected", True, (255, 255, 255))
             tag_rect = pygame.Rect(rect.x + 18, rect.y + rect.height - 42, tag_surface.get_width() + 24, 26)
             pygame.draw.rect(surface, ACCENT_COLOR, tag_rect, border_radius=12)
             surface.blit(tag_surface, (tag_rect.x + 12, tag_rect.y + 4))
 
     if not maps_cfg:
-        placeholder = fonts["regular"].render("등록된 맵이 없습니다.", True, (110, 120, 140))
+        placeholder = fonts["regular"].render("No maps registered.", True, (110, 120, 140))
         surface.blit(placeholder, (main_rect.x + (main_rect.width - placeholder.get_width()) // 2, main_rect.y + main_rect.height // 2))
 
-    instructions = "← → 또는 A/D: 맵 변경  ·  Enter/Space: 선택  ·  TAB: 영역 이동  ·  ESC/Q: 종료  ·  R: 리플레이 새로고침"
+    instructions = "← → or A/D: change map  ·  Enter/Space: select  ·  TAB: focus  ·  ESC/Q: quit  ·  R: refresh replays"
     instr_surface = fonts["regular"].render(instructions, True, (72, 82, 95))
     surface.blit(instr_surface, (main_rect.x + (main_rect.width - instr_surface.get_width()) // 2, main_rect.bottom - 48))
 
@@ -1664,11 +1652,11 @@ def render_selection_side_panel(
         pygame.draw.line(surface, (192, 200, 214), (section_x, divider_y), (section_x + section_width, divider_y), 1)
         return divider_y + 12
 
-    y = draw_header("학생 알고리즘", y)
+    y = draw_header("Student Algorithms", y)
     agent_item_height = 66
     if not agent_entries:
         empty_rect = pygame.Rect(section_x, y, section_width, 70)
-        draw_wrapped_text(surface, "감지된 알고리즘이 없습니다.", font, (145, 155, 175), empty_rect, max_lines=3)
+        draw_wrapped_text(surface, "No algorithms detected.", font, (145, 155, 175), empty_rect, max_lines=3)
         y = empty_rect.bottom + 16
     else:
         for idx, entry in enumerate(agent_entries):
@@ -1689,11 +1677,11 @@ def render_selection_side_panel(
             pygame.draw.rect(surface, border_color, item_rect, 2, border_radius=14)
 
             status_color = (44, 136, 72) if running else ((185, 68, 68) if not available else (110, 120, 150))
-            status_text = "실행 중" if running else ("파일 없음" if not available else "대기")
+            status_text = "Running" if running else ("Missing file" if not available else "Idle")
 
             pygame.draw.circle(surface, status_color, (item_rect.x + 18, item_rect.y + item_rect.height // 2), 8)
             label_rect = pygame.Rect(item_rect.x + 36, item_rect.y + 10, item_rect.width - 44, 24)
-            draw_wrapped_text(surface, entry.get("label", "학생 알고리즘"), font, (35, 45, 82), label_rect, max_lines=1, ellipsis=True)
+            draw_wrapped_text(surface, entry.get("label", "Student Algorithm"), font, (35, 45, 82), label_rect, max_lines=1, ellipsis=True)
             status_rect = pygame.Rect(item_rect.x + 36, item_rect.y + 36, item_rect.width - 44, 22)
             draw_wrapped_text(surface, status_text, font, status_color, status_rect, max_lines=1, ellipsis=True)
 
@@ -1706,11 +1694,11 @@ def render_selection_side_panel(
         y = message_rect.bottom + 18
 
     y = max(y, sidebar_rect.y + int(sidebar_rect.height * 0.48))
-    y = draw_header("리플레이", y)
+    y = draw_header("Replays", y)
 
     if not replay_entries:
         empty_rect = pygame.Rect(section_x, y, section_width, 80)
-        draw_wrapped_text(surface, "저장된 리플레이가 없습니다.", font, (145, 155, 175), empty_rect, max_lines=3)
+        draw_wrapped_text(surface, "No saved replays.", font, (145, 155, 175), empty_rect, max_lines=3)
         y = empty_rect.bottom + 18
     else:
         max_visible = 7 if sidebar_rect.height > 880 else 5
@@ -1742,7 +1730,7 @@ def render_selection_side_panel(
                     timestamp = dt.strftime("%m-%d %H:%M") if sidebar_rect.width < 420 else dt.strftime("%Y-%m-%d %H:%M")
                 except ValueError:
                     pass
-            map_name = meta.get("map_name") or meta.get("map_key") or "맵"
+            map_name = meta.get("map_name") or meta.get("map_key") or "Map"
             score = meta.get("score")
             result = meta.get("result", "")
             status_color = (190, 60, 60) if result == "collision" else (102, 112, 142)
@@ -1754,14 +1742,14 @@ def render_selection_side_panel(
             details_rect = pygame.Rect(item_rect.x + 16, item_rect.y + 38, item_rect.width - 32, 24)
             detail_parts = []
             if isinstance(score, (int, float)):
-                detail_parts.append(f"{score:.1f}점")
+                detail_parts.append(f"{score:.1f} pts")
             if result:
                 detail_parts.append(result)
             draw_wrapped_text(surface, " · ".join(detail_parts), font, status_color, details_rect, max_lines=1, ellipsis=True)
 
             if entry.get("error"):
                 error_rect = pygame.Rect(item_rect.x + 16, item_rect.bottom - 24, item_rect.width - 32, 18)
-                draw_wrapped_text(surface, "불러오기 실패", font, (190, 70, 70), error_rect, max_lines=1, ellipsis=True)
+                draw_wrapped_text(surface, "Failed to load", font, (190, 70, 70), error_rect, max_lines=1, ellipsis=True)
 
             replay_rects.append((idx, item_rect))
             y += replay_item_height + 12
@@ -1829,7 +1817,7 @@ def map_selection_loop(
                     running_proc = agent_manager.is_running() and agent_manager.active_idx == idx
                     available = exists
                 agent_entries_info.append({
-                    "label": entry.get("label", "학생 알고리즘"),
+                    "label": entry.get("label", "Student Algorithm"),
                     "exists": exists,
                     "available": available,
                     "running": running_proc,
@@ -1837,7 +1825,7 @@ def map_selection_loop(
                 })
         current_agent_active = agent_manager.active_idx if agent_manager and agent_manager.is_running() else None
         if prev_agent_active is not None and current_agent_active is None and agent_message is None:
-            agent_message = "학생 알고리즘이 종료되었습니다."
+            agent_message = "Student algorithm terminated."
             agent_message_until = pygame.time.get_ticks() + 2500
         prev_agent_active = current_agent_active
 
@@ -1899,22 +1887,22 @@ def map_selection_loop(
                     if event.key in (pygame.K_RETURN, pygame.K_SPACE) and agent_manager and agent_entries_info:
                         if agent_manager.is_running() and agent_manager.active_idx == agent_idx:
                             agent_manager.stop()
-                            agent_message = "학생 알고리즘을 종료했습니다."
+                            agent_message = "Stopped the student algorithm."
                             agent_message_until = pygame.time.get_ticks() + 2500
                         else:
                             success, err = agent_manager.start(agent_idx, host, port)
                             if success:
-                                agent_message = "학생 알고리즘을 실행했습니다."
+                                agent_message = "Launched the student algorithm."
                             else:
-                                agent_message = f"실행 실패: {err}"
+                                agent_message = f"Launch failed: {err}"
                             agent_message_until = pygame.time.get_ticks() + 3500
                         continue
                     if event.key in (pygame.K_BACKSPACE, pygame.K_DELETE, pygame.K_x):
                         if agent_manager and agent_manager.is_running():
                             agent_manager.stop()
-                            agent_message = "학생 알고리즘을 종료했습니다."
+                            agent_message = "Stopped the student algorithm."
                         else:
-                            agent_message = "실행 중인 알고리즘이 없습니다."
+                            agent_message = "No algorithm is currently running."
                         agent_message_until = pygame.time.get_ticks() + 2500
                         continue
                     continue
@@ -1979,10 +1967,10 @@ def map_selection_loop(
 
         if ipc and ipc.is_connected:
             peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{host}:{port}"
-            connection_text = f"학생 알고리즘 연결됨 — {peer}"
+            connection_text = f"Student algorithm connected — {peer}"
             ipc_connected = True
         else:
-            connection_text = f"학생 알고리즘 연결 대기 중 — {host}:{port}" if ipc else None
+            connection_text = f"Student algorithm waiting — {host}:{port}" if ipc else None
             ipc_connected = False
 
         card_rects, agent_rects, replay_rects, replay_window_start = render_map_selection(
@@ -2024,7 +2012,7 @@ def reseed_map_states(map_states: dict, maps_cfg):
 
 # ----------------- IPC Controller -----------------
 class IPCController:
-    """학생 알고리즘과의 JSONL IPC를 호스팅하는 단일 클라이언트 TCP 서버."""
+    """Single-client TCP server that hosts JSONL IPC for the student algorithm."""
 
     def __init__(self, host="127.0.0.1", port=55556, timeout=0.15):
         self.host = host
@@ -2037,7 +2025,7 @@ class IPCController:
         except OSError as exc:
             self.listen_sock.close()
             raise RuntimeError(
-                f"[IPC] 포트 {self.host}:{self.port} 바인딩 실패 - 다른 프로세스가 사용 중입니다"
+                f"[IPC] failed to bind {self.host}:{self.port} - port already in use"
             ) from exc
 
         self.listen_sock.listen(1)
@@ -2049,7 +2037,7 @@ class IPCController:
         self.peer = None
 
     def poll_accept(self) -> bool:
-        """알고리즘 클라이언트 연결을 논블로킹으로 수락."""
+        """Accept client connections without blocking."""
         if self.sock is not None:
             return True
 
@@ -2093,14 +2081,14 @@ class IPCController:
         return self.sock is not None
 
     def send_obs(self, obs: dict):
-        """관측값 한 틱을 JSON Lines 한 줄로 직렬화하여 송신합니다."""
+        """Send one observation tick as a JSON Lines record."""
         if not self.sock:
             raise ConnectionError("IPC send attempted without active connection")
         line = (json.dumps(obs, ensure_ascii=False) + "\n").encode()
         self.sock.sendall(line)
 
     def send_map(self, map_payload: dict):
-        """연결 직후 맵 정보를 `{"map": ...}` 형태로 한 줄 송신합니다."""
+        """Immediately send the map payload as `{"map": ...}` after connecting."""
         if not self.sock:
             raise ConnectionError("IPC send attempted without active connection")
         message = {"map": map_payload}
@@ -2109,7 +2097,7 @@ class IPCController:
         self.sock.sendall(line)
 
     def recv_cmd(self) -> dict:
-        """학생 알고리즘이 보낸 명령 한 줄을 수신하고 필수 키만 추려 표준화합니다."""
+        """Receive one command line from the student algorithm and normalize expected keys."""
         if not self.sock:
             raise ConnectionError("IPC recv attempted without active connection")
         while b"\n" not in self.buf:
@@ -2129,7 +2117,7 @@ class IPCController:
         }
 
 def run_replay_mode(screen, clock, sw, sh, fonts, replay_path: str, meta: dict, frames: list[dict]):
-    """저장된 리플레이 파일을 재생한다."""
+    """Play back a previously saved replay file."""
     map_key = meta.get("map_key")
     map_cfg = next((cfg for cfg in AVAILABLE_MAPS if cfg.get("key") == map_key), AVAILABLE_MAPS[0])
     map_seed = meta.get("map_seed")
@@ -2198,11 +2186,11 @@ def run_replay_mode(screen, clock, sw, sh, fonts, replay_path: str, meta: dict, 
     reset_playback()
 
     reason_map = {
-        "success": "성공",
-        "collision": "충돌",
-        "timeout": "시간초과",
-        "quit": "종료",
-        "replay": "리플레이",
+        "success": "Success",
+        "collision": "Collision",
+        "timeout": "Timeout",
+        "quit": "Quit",
+        "replay": "Replay",
     }
 
     running = True
@@ -2251,9 +2239,9 @@ def run_replay_mode(screen, clock, sw, sh, fonts, replay_path: str, meta: dict, 
         hud1 = f"t={current_time:6.2f}s  frame={min(frame_idx, total_frames)}/{total_frames}"
         steer_deg = math.degrees(delta)
         hud2 = f"steer={steer_deg:6.2f}°  accel={float(current_cmd.get('accel', 0.0))*100:5.1f}%  brake={float(current_cmd.get('brake', 0.0))*100:5.1f}%  gear={current_cmd.get('gear', 'D')}"
-        play_state = "재생" if playing else "일시정지"
-        hud3 = f"맵: {map_cfg['name']}  |  모드: Replay ({play_state})"
-        hint = "SPACE: 재생/일시정지  ·  R: 처음부터  ·  ESC/Q: 종료"
+        play_state = "Play" if playing else "Paused"
+        hud3 = f"Map: {map_cfg['name']}  |  Mode: Replay ({play_state})"
+        hint = "SPACE: play/pause  ·  R: restart  ·  ESC/Q: quit"
         screen.blit(fonts["regular"].render(hud1, True, (0, 0, 0)), (12, 8))
         screen.blit(fonts["regular"].render(hud2, True, (0, 0, 0)), (12, 26))
         hud3_img = fonts["regular"].render(hud3, True, (0, 0, 0))
@@ -2288,7 +2276,7 @@ def parse_args():
     ap.add_argument("--mode", choices=["ipc","wasd","replay"], default="ipc")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=55556)
-    ap.add_argument("--replay", help="저장된 리플레이 파일(JSON)을 재생합니다.")
+    ap.add_argument("--replay", help="Play back a saved replay file (JSON).")
     return ap.parse_args()
 
 def main():
@@ -2300,7 +2288,7 @@ def main():
         try:
             replay_meta, replay_frames = load_replay_file(args.replay)
         except Exception as exc:
-            print(f"[replay] 로드 실패: {exc}")
+            print(f"[replay] failed to load: {exc}")
             return
 
     # 1) pygame
@@ -2393,7 +2381,7 @@ def main():
                 try:
                     replay_meta, replay_frames = load_replay_file(payload)
                 except Exception as exc:
-                    selection_error = f"리플레이 로드 실패: {exc}"
+                    selection_error = f"Failed to load replay: {exc}"
                     continue
             
                 screen = screen_state["surface"]
@@ -2404,7 +2392,7 @@ def main():
                 map_seeds_dirty = True
                 continue
             if choice_kind != "map":
-                selection_error = "알 수 없는 선택 항목입니다."
+                selection_error = "Unknown selection item."
                 continue
 
             selected_map_idx = payload
@@ -2415,10 +2403,10 @@ def main():
                 bundle = ensure_map_loaded(selected_cfg, map_cache, seed=selected_seed)
             except FileNotFoundError:
                 missing = selected_cfg["filename"]
-                selection_error = f"맵 파일을 찾을 수 없습니다: {missing}"
+                selection_error = f"Map file not found: {missing}"
                 continue
             except Exception as e:
-                selection_error = f"맵 로드 실패: {e}"
+                selection_error = f"Failed to load map: {e}"
                 continue
 
             M = bundle["assets"]
@@ -2437,7 +2425,7 @@ def main():
             continue
 
         if M is None:
-            selection_error = "맵이 선택되지 않았습니다."
+            selection_error = "No map selected."
             ui_mode = "map_select"
             map_seeds_dirty = True
             continue
@@ -2460,7 +2448,7 @@ def main():
         P = Params()
         free_slot_indices = [i for i, occ in enumerate(M.occupied_idx) if not occ]
         if not free_slot_indices:
-            raise RuntimeError("맵에 사용 가능한 주차 슬롯이 없습니다.")
+            raise RuntimeError("No available parking slots in the map.")
 
         def slot_center(idx: int) -> tuple[float, float]:
             rect = M.slots[idx]
@@ -2779,19 +2767,19 @@ def main():
 
                 blink = (pygame.time.get_ticks() // 400) % 2 == 0
                 status_color = (200, 40, 40) if blink else (255, 160, 160)
-                status_text = "학생 알고리즘 연결 대기 중"
+                status_text = "Waiting for student algorithm"
                 status = font_large.render(status_text, True, status_color)
                 status_pos = ((sw - status.get_width()) // 2, title_pos[1] + title.get_height() + 30)
                 screen.blit(status, status_pos)
 
-                info_text = f"수신 대기: {args.host}:{args.port}"
+                info_text = f"Listening: {args.host}:{args.port}"
                 info = font.render(info_text, True, (90, 90, 90))
                 info_pos = ((sw - info.get_width()) // 2, status_pos[1] + status.get_height() + 18)
                 screen.blit(info, info_pos)
-                map_info = font.render(f"선택된 맵: {AVAILABLE_MAPS[selected_map_idx]['name']}", True, (70, 70, 70))
+                map_info = font.render(f"Selected map: {AVAILABLE_MAPS[selected_map_idx]['name']}", True, (70, 70, 70))
                 map_pos = ((sw - map_info.get_width()) // 2, info_pos[1] + info.get_height() + 16)
                 screen.blit(map_info, map_pos)
-                hint = font.render("P: 메인 화면", True, (80, 80, 80))
+                hint = font.render("P: main screen", True, (80, 80, 80))
                 screen.blit(hint, ((sw - hint.get_width()) // 2, map_pos[1] + map_info.get_height() + 16))
             else:
                 screen.fill((245, 245, 245))
@@ -2854,15 +2842,15 @@ def main():
                 if control_mode == "ipc":
                     if ipc.is_connected:
                         peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
-                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 연결: {peer}"
+                        hud3 = f"Map: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC connected: {peer}"
                     else:
-                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC 대기: {args.host}:{args.port}"
+                        hud3 = f"Map: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  IPC waiting: {args.host}:{args.port}"
                 else:
                     if args.mode == "wasd":
-                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: WASD (W/S throttle, A/D steer, R gear, SPACE brake)"
+                        hud3 = f"Map: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: WASD (W/S throttle, A/D steer, R gear, SPACE brake)"
                     else:
-                        hud3 = f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: 내장 WASD (학생 알고리즘 없음)"
-                hud_hint = "P: 일시정지"
+                        hud3 = f"Map: {AVAILABLE_MAPS[selected_map_idx]['name']}  |  Mode: built-in WASD (no agent)"
+                hud_hint = "P: pause"
 
                 screen.blit(font.render(hud1, True, (0, 0, 0)), (12, 8))
                 screen.blit(font.render(hud2, True, (0, 0, 0)), (12, 26))
@@ -2871,7 +2859,7 @@ def main():
                 hint_img = font.render(hud_hint, True, (70, 70, 70))
                 screen.blit(hint_img, (sw - hint_img.get_width() - 16, 44))
 
-                requirement_text = f"요구사항: {orientation_label}"
+                requirement_text = f"Requirement: {orientation_label}"
                 requirement_surface = fonts["requirement"].render(requirement_text, True, requirement_color)
                 requirement_y = max(12, vp_oy - requirement_surface.get_height() - 12)
                 requirement_pos = (
@@ -2882,17 +2870,17 @@ def main():
 
                 if paused:
                     stats_lines = [
-                        f"시간: {t:0.1f} s",
-                        f"속도: {state.v:0.2f} m/s",
-                        f"조향: {math.degrees(delta):0.1f} deg",
-                        f"충돌 횟수: {collision_count}",
-                        f"맵: {AVAILABLE_MAPS[selected_map_idx]['name']}",
+                        f"Time: {t:0.1f} s",
+                        f"Speed: {state.v:0.2f} m/s",
+                        f"Steer: {math.degrees(delta):0.1f} deg",
+                        f"Collisions: {collision_count}",
+                        f"Map: {AVAILABLE_MAPS[selected_map_idx]['name']}",
                     ]
                     instruction_lines = [
-                        "P: 계속",
-                        "M: 맵 선택",
-                        "R: 재시작 (라운드 종료 후)",
-                        "ESC/Q: 종료",
+                        "P: continue",
+                        "M: select map",
+                        "R: restart (after finish)",
+                        "ESC/Q: quit",
                     ]
                     draw_pause_overlay(screen, fonts, sw, sh, stats_lines, instruction_lines)
 
@@ -2927,9 +2915,9 @@ def main():
         stage_idx, stage_profile = get_stage_profile(active_map_cfg)
         score_value, score_details = compute_round_score(round_stats, stage_profile, why, M.extent)
         RECENT_RESULTS.append({
-            "map": active_map_cfg["name"] if active_map_cfg else "알 수 없음",
+            "map": active_map_cfg["name"] if active_map_cfg else "Unknown",
             "stage": stage_idx,
-            "stage_label": stage_profile.get("label", f"{stage_idx}단계"),
+            "stage_label": stage_profile.get("label", f"Stage {stage_idx}"),
             "score": score_value,
             "details": score_details,
             "reason": why,
@@ -2950,7 +2938,7 @@ def main():
             "map_seed": map_seed,
             "target_idx": current_target_idx,
             "stage": stage_idx,
-            "stage_label": stage_profile.get("label", f"{stage_idx}단계"),
+            "stage_label": stage_profile.get("label", f"Stage {stage_idx}"),
             "result": why,
             "score": score_value,
             "mode": replay_mode_label,
@@ -2991,10 +2979,10 @@ def main():
         title = "SUCCESS" if why == "success" else ("TIMEOUT" if why == "timeout" else "COLLISION" if why == "collision" else "QUIT")
         score_cap = score_details.get("score_cap", 100.0)
         info_lines = []
-        info_lines.append(f"총점 {score_value:.1f} / {score_cap:.0f}")
+        info_lines.append(f"Final score {score_value:.1f} / {score_cap:.0f}")
         perf = score_details.get("performance_component", 0.0)
         safe_base = score_details.get("safe_base", 50.0)
-        info_lines.append(f"구성: 안전 {safe_base:.0f} + 성과 {perf:.1f}")
+        info_lines.append(f"Breakdown: safety {safe_base:.0f} + performance {perf:.1f}")
 
         iou_value = score_details.get("parking_iou")
         if isinstance(iou_value, (int, float)):
@@ -3003,15 +2991,15 @@ def main():
         component_scores = score_details.get("component_scores", {}) or {}
         if component_scores:
             info_lines.append("")
-            info_lines.append("세부 점수")
+            info_lines.append("Detailed metrics")
             component_labels = {
-                "time": "시간",
-                "distance": "이동 거리",
-                "speed": "평균 속도",
-                "steer_flip": "조향 전환",
-                "parking_iou": "슬롯 적합도",
-                "parking_orientation": "방향 일치",
-                "parking_stop": "종료 정지",
+                "time": "Time",
+                "distance": "Distance",
+                "speed": "Average speed",
+                "steer_flip": "Steering reversals",
+                "parking_iou": "Slot IoU",
+                "parking_orientation": "Orientation match",
+                "parking_stop": "Stopped in slot",
             }
             for key, value in component_scores.items():
                 label = component_labels.get(key, key)
@@ -3026,12 +3014,12 @@ def main():
             speed_target = stage_profile.get("speed_target", 0.0)
             steer_flip_target = stage_profile.get("steer_flip_target", 0)
             info_lines.append("")
-            info_lines.append("목표 대비")
+            info_lines.append("Vs targets")
             if time_target > 0:
-                info_lines.append(f"- 시간 {round_stats.elapsed:.1f}s / {time_target:.1f}s")
-            info_lines.append(f"- 거리 {round_stats.distance:.1f}m / {distance_target:.1f}m")
-            info_lines.append(f"- 평균 속도 {score_details.get('avg_speed', 0.0):.2f}m/s / {speed_target:.2f}m/s")
-            info_lines.append(f"- 조향 전환 {round_stats.direction_flips}회 / {steer_flip_target}회")
+                info_lines.append(f"- Time {round_stats.elapsed:.1f}s / {time_target:.1f}s")
+            info_lines.append(f"- Distance {round_stats.distance:.1f}m / {distance_target:.1f}m")
+            info_lines.append(f"- Average speed {score_details.get('avg_speed', 0.0):.2f}m/s / {speed_target:.2f}m/s")
+            info_lines.append(f"- Steering reversals {round_stats.direction_flips} / {steer_flip_target}")
 
         draw_overlay(screen, title, info_lines, font, sw, sh)
         pygame.display.flip()
