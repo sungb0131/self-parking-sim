@@ -19,9 +19,14 @@ git clone https://github.com/sungb0131/self-parking-user-algorithms.git parking-
 
 ## 시뮬레이터 실행
 
+이 프로젝트는 Python 3.10 이상에서 테스트되었습니다. 시스템에 3.10 해석기가 없다면 `pyenv`나 `asdf`로 설치한 뒤 아래 명령을 실행하세요.
+
 ```bash
-python3 -m pip install -r requirements.txt
-python3 demo_self_parking_sim.py
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python demo_self_parking_sim.py
 ```
 
 에이전트는 `parking-agent/` 디렉터리(또는 별도 저장소)에서 개발하면 됩니다.

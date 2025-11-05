@@ -4,6 +4,8 @@
 #   python demo_self_parking_sim.py --host 127.0.0.1 --port 55556
 #   python demo_self_parking_sim.py --mode wasd      # (디버그용) 키보드 제어
 
+from __future__ import annotations
+
 import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "0")  # macOS IME 노이즈 억제
