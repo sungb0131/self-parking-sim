@@ -60,9 +60,10 @@ PARKING_SUCCESS_IOU = 0.30  # 최소 IoU 기준 (30%)을 만족해야 합격으�
 # 주차 방향 판정에 사용할 최소 정렬 코사인 값 (약 ±48도)
 ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
 
-BASE_WINDOW_SIZE = (1600, 1000)
-MIN_WINDOW_SIZE = (1280, 800)
-SIDEBAR_WIDTH_RANGE = (360, 480)
+BASE_WINDOW_SIZE = (1480, 900)
+MIN_WINDOW_SIZE = (1120, 720)
+SIDEBAR_WIDTH_RANGE = (320, 460)
+MAIN_VIEW_MIN_WIDTH = 560
 MAP_CARD_GAP = 20
 MAP_CARD_PADDING = 32
 MAP_CARD_ASPECT = 16 / 9
@@ -101,15 +102,31 @@ def enforce_min_window_size(width: int, height: int) -> tuple[int, int]:
 
 
 def compute_layout(sw: int, sh: int) -> tuple[pygame.Rect, pygame.Rect]:
-    min_sidebar, max_sidebar = SIDEBAR_WIDTH_RANGE
-    sidebar_width = int(sw * 0.28)
-    sidebar_width = max(min_sidebar, min(sidebar_width, max_sidebar))
+    """화면 폭에 따라 메인 뷰와 사이드바 폭을 유연하게 조절한다."""
+    base_width = BASE_WINDOW_SIZE[0]
+    scale = clamp(sw / base_width, 0.65, 1.0)
+
+    base_min_sidebar, base_max_sidebar = SIDEBAR_WIDTH_RANGE
+    min_sidebar = max(260, int(base_min_sidebar * scale))
+    max_sidebar = max(min_sidebar, int(base_max_sidebar * scale))
+
+    min_main = max(500, int(MAIN_VIEW_MIN_WIDTH * scale))
+    target_sidebar = int(sw * (0.24 + (1.0 - scale) * 0.08))
+    sidebar_width = int(clamp(target_sidebar, min_sidebar, max_sidebar))
     main_width = sw - sidebar_width
-    if main_width < 720:
-        sidebar_width = max(min_sidebar, sw - 720)
-        main_width = sw - sidebar_width
-    sidebar_width = max(min_sidebar, min(sidebar_width, sw - 480))
-    main_rect = pygame.Rect(0, 0, max(main_width, 480), sh)
+
+    if main_width < min_main:
+        main_width = max(min_main, sw - min_sidebar)
+        sidebar_width = sw - main_width
+
+    if sidebar_width < min_sidebar:
+        sidebar_width = min_sidebar
+        main_width = max(sw - sidebar_width, min_main)
+
+    sidebar_width = max(0, min(sidebar_width, sw))
+    main_width = max(0, min(sw - sidebar_width, sw))
+
+    main_rect = pygame.Rect(0, 0, main_width, sh)
     sidebar_rect = pygame.Rect(main_rect.right, 0, sw - main_rect.width, sh)
     return main_rect, sidebar_rect
 
