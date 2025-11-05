@@ -1,9 +1,14 @@
 # Parking Workspace
 
-이 저장소는 시뮬레이터와 학생 에이전트 구현을 한 번에 다루기 위한 상위 워크스페이스입니다.
+이 저장소는 [`self-parking-sim`](https://github.com/sungb0131/self-parking-sim) 시뮬레이터와 학생 에이전트 구현을 한 번에 다루기 위한 상위 워크스페이스입니다. 기존에 `parking-sim/` 폴더 안에 있던 시뮬레이터 파일을 모두 최상위 디렉터리로 옮겨 두었습니다.
 
-- `parking-sim/` — 기존 [`self-parking-sim`](https://github.com/sungb0131/self-parking-sim) 프로젝트를 그대로 옮겨 놓은 디렉터리입니다. 시뮬레이터 실행, 맵 자산, 스크립트가 모두 여기에 포함됩니다.
-- `parking-agent/` — [`self-parking-user-algorithms`](https://github.com/sungb0131/self-parking-user-algorithms) 저장소를 클론해 사용하는 디렉터리입니다.
+## 구성
+
+- `demo_self_parking_sim.py` — 시뮬레이터 데모 실행 진입점
+- `student_algorithms.py` — 학생용 에이전트 베이스 코드
+- `parking_assets_layers_75x50.mat` — 데모에서 사용하는 주차장 자산
+- `requirements.txt` — 시뮬레이터 실행에 필요한 파이썬 패키지 목록
+- (선택) `parking-agent/` — [`self-parking-user-algorithms`](https://github.com/sungb0131/self-parking-user-algorithms) 저장소를 클론해 사용하는 위치
 
 ## 초기 설정
 
@@ -12,12 +17,11 @@
 git clone https://github.com/sungb0131/self-parking-user-algorithms.git parking-agent
 ```
 
-시뮬레이터는 `parking-sim/` 디렉터리에서 기존과 동일하게 실행합니다.
+## 시뮬레이터 실행
 
 ```bash
-cd parking-sim
 python3 -m pip install -r requirements.txt
 python3 demo_self_parking_sim.py
 ```
 
-에이전트는 `parking-agent/` 디렉터리에서 개발·실행하면 됩니다.
+에이전트는 `parking-agent/` 디렉터리(또는 별도 저장소)에서 개발하면 됩니다.
