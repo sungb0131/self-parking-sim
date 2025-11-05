@@ -945,22 +945,18 @@ AVAILABLE_MAPS = [
 ]
 
 # 스테이지별 점수 기준과 패널티 가중치를 정의합니다.
-# safe_base는 기본 안전 점수, weights는 항목별 패널티 비중을 뜻합니다.
-# expected_orientation은 최종 주차 방향 요구 조건을 나타냅니다.
+# weights는 항목별 패널티 비중을, expected_orientation은 최종 주차 방향 요구 조건을 나타냅니다.
 STAGE_RULES = {
     1: {
         "label": "1단계",
-        "safe_base": 55.0,
         "time_target": 65.0,
         "distance_factor": 0.90,
-        "turn_target": 3,
         "speed_target": 2.0,
         "steer_flip_target": 4,
         "expected_orientation": "front_in",
         "weights": {
             "time": 8.0,
             "distance": 6.0,
-            "turn": 5.0,
             "speed": 5.0,
             "steer_flip": 4.0,
             "parking_iou": 9.0,
@@ -970,17 +966,14 @@ STAGE_RULES = {
     },
     2: {
         "label": "2단계",
-        "safe_base": 50.0,
         "time_target": 80.0,
         "distance_factor": 0.95,
-        "turn_target": 3,
         "speed_target": 2.8,
         "steer_flip_target": 5,
         "expected_orientation": "front_in",
         "weights": {
             "time": 9.0,
             "distance": 6.0,
-            "turn": 6.0,
             "speed": 6.0,
             "steer_flip": 5.0,
             "parking_iou": 9.0,
@@ -990,17 +983,14 @@ STAGE_RULES = {
     },
     3: {
         "label": "3단계",
-        "safe_base": 45.0,
         "time_target": 95.0,
         "distance_factor": 1.05,
-        "turn_target": 4,
         "speed_target": 3.2,
         "steer_flip_target": 6,
         "expected_orientation": "rear_in",
         "weights": {
             "time": 11.0,
             "distance": 7.0,
-            "turn": 6.0,
             "speed": 6.0,
             "steer_flip": 5.0,
             "parking_iou": 10.0,
@@ -1010,9 +1000,23 @@ STAGE_RULES = {
     },
 }
 
-def stage_weight_sum(stage_profile: dict) -> float:
-    weights = stage_profile.get("weights", {})
-    return sum(float(v) for v in weights.values())
+ORIENTATION_LABELS = {
+    "front_in": "전면 주차",
+    "rear_in": "후면 주차",
+}
+
+
+ORIENTATION_LABELS_SHORT = {
+    "front_in": "전면",
+    "rear_in": "후면",
+}
+
+
+def describe_orientation(expected: str | None) -> str:
+    if not expected:
+        return "방향 자유"
+    return ORIENTATION_LABELS.get(expected, expected)
+
 
 def compute_weighted_score(component_score: float, weight: float) -> float:
     return clamp(component_score, 0.0, 1.0) * weight
@@ -1087,13 +1091,12 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     time_target = stage_profile.get("time_target", 1.0)
     distance_factor = stage_profile.get("distance_factor", 1.0)
     distance_target = max(1e-6, diag * distance_factor)
-    turn_target = max(1, int(stage_profile.get("turn_target", 1)))
     speed_target = max(1e-6, float(stage_profile.get("speed_target", 1.0)))
     steer_flip_target = max(1, int(stage_profile.get("steer_flip_target", 1)))
     expected_orientation = stage_profile.get("expected_orientation")
     weights = stage_profile.get("weights", {})
-    safe_base = float(stage_profile.get("safe_base", 40.0))
-    total_weight = stage_weight_sum(stage_profile)
+    # 모든 스테이지에서 동일한 안전 점수를 부여해 기본 점수를 고정한다.
+    safe_base = 50.0
 
     avg_speed = details["avg_speed"]
     # 항목별 기여도(패널티 반영 전의 가중 점수)를 기록합니다.
@@ -1105,9 +1108,6 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
 
     distance_score = inverse_ratio(stats.distance, distance_target)
     component_breakdown["distance"] = compute_weighted_score(distance_score, weights.get("distance", 0.0))
-
-    turn_score = limited_ratio(stats.gear_switches, turn_target)
-    component_breakdown["turn"] = compute_weighted_score(turn_score, weights.get("turn", 0.0))
 
     # 평균 속도 달성도를 시간 대비 0~1 범위로 정규화합니다.
     speed_score = clamp(avg_speed / speed_target, 0.0, 1.0)
@@ -1127,9 +1127,10 @@ def compute_round_score(stats: RoundStats, stage_profile: dict, result_reason: s
     stop_component = clamp(1.0 - stats.final_speed / 0.3, 0.0, 1.0)
     component_breakdown["parking_stop"] = compute_weighted_score(stop_component, weights.get("parking_stop", 0.0))
 
+    total_weight = sum(float(weights.get(key, 0.0)) for key in component_breakdown)
     # 가중 패널티를 모두 합산하여 성능 점수를 계산합니다.
     performance_component = sum(component_breakdown.values())
-    score_cap = safe_base + total_weight if total_weight > 0 else 100.0
+    score_cap = 100.0
     final_score = clamp(safe_base + performance_component, 0.0, score_cap)
 
     # 세부 내역을 details에 삽입하여 HUD와 리플레이에서 활용합니다.
@@ -1433,7 +1434,7 @@ def render_map_selection(
     card_width = (available_width - (columns - 1) * MAP_CARD_GAP) / max(columns, 1)
     card_width = max(230, min(card_width, 380))
     thumbnail_height = card_width / MAP_CARD_ASPECT
-    info_height = 160
+    info_height = 180
     card_height = int(thumbnail_height + info_height)
 
     rows = (len(maps_cfg) + columns - 1) // columns if columns else 0
@@ -1516,10 +1517,32 @@ def render_map_selection(
             max_lines=3,
         )
 
+        orientation_value = cfg.get("expected_orientation")
+        orientation_label = describe_orientation(orientation_value)
+        requirement_prefix = "요구 방향"
+        requirement_text = f"{requirement_prefix}: {orientation_label}"
+        requirement_font = fonts["large"] if orientation_value else fonts["regular"]
+        requirement_color = (44, 64, 128) if orientation_value else (96, 104, 132)
+        max_req_width = rect.width - 40
+        requirement_display = ellipsize_text(requirement_font, requirement_text, max_req_width)
+        requirement_surface = requirement_font.render(requirement_display, True, requirement_color)
+        orientation_margin_top = 96 if orientation_value else 88
+        requirement_y = summary_rect.bottom + 8
+        requirement_y = max(requirement_y, rect.y + orientation_margin_top)
+        requirement_y = min(requirement_y, rect.bottom - 84)
+        requirement_pos = (
+            rect.x + (rect.width - requirement_surface.get_width()) // 2,
+            requirement_y,
+        )
+        surface.blit(requirement_surface, requirement_pos)
+
+        stats_top = requirement_pos[1] + requirement_surface.get_height() + 8
+        stats_top = min(stats_top, rect.bottom - 58)
+
         if bundle:
             meta = bundle.get("meta", {})
             stats_text = f"전체 슬롯 {meta.get('slots_total', '?')}개 · 점유 {meta.get('occupied_total', '?')}개"
-            stats_rect = pygame.Rect(rect.x + 20, rect.bottom - 56, rect.width - 40, 24)
+            stats_rect = pygame.Rect(rect.x + 20, stats_top, rect.width - 40, 24)
             draw_wrapped_text(surface, stats_text, fonts["regular"], (100, 110, 140), stats_rect, align="center", max_lines=1)
 
         footer_surface = fonts["regular"].render(f"{idx + 1}/{len(maps_cfg)}", True, (120, 130, 150))
@@ -2257,7 +2280,15 @@ def main():
     font = load_font_with_fallback(18)
     font_large = load_font_with_fallback(28, bold=True)
     font_title = load_font_with_fallback(54, bold=True)
-    fonts = {"regular": font, "large": font_large, "title": font_title}
+    font_requirement = load_font_with_fallback(36, bold=True)
+    font_small = load_font_with_fallback(16, bold=True)
+    fonts = {
+        "regular": font,
+        "large": font_large,
+        "title": font_title,
+        "requirement": font_requirement,
+        "small": font_small,
+    }
 
     # Viewport margins so HUD stays outside of the lot rendering area.
     update_viewport(*screen_state["size"])
@@ -2727,6 +2758,11 @@ def main():
             else:
                 screen.fill((245, 245, 245))
 
+                orientation_value = active_map_cfg.get("expected_orientation") if active_map_cfg else None
+                orientation_label = describe_orientation(orientation_value)
+                orientation_short = ORIENTATION_LABELS_SHORT.get(orientation_value, orientation_label)
+                requirement_color = (182, 52, 52) if orientation_value else (90, 100, 130)
+
                 # Helpful axes (fade grey) and viewport border.
                 x0s, y0s = world_to_screen(0, 0, world, sw, sh)
                 pygame.draw.line(screen, (220, 220, 220), (0, y0s), (sw, y0s), 1)
@@ -2751,6 +2787,20 @@ def main():
 
                 draw_rect(screen, target_slot, (180, 255, 180), world, sw, sh, width=0)
                 draw_rect(screen, target_slot, (50, 140, 50), world, sw, sh, width=2)
+
+                if orientation_value:
+                    slot_cx = (target_slot[0] + target_slot[1]) * 0.5
+                    slot_cy = (target_slot[2] + target_slot[3]) * 0.5
+                    slot_screen = world_to_screen(slot_cx, slot_cy, world, sw, sh)
+                    slot_font = fonts["small"]
+                    slot_surface = slot_font.render(orientation_short, True, requirement_color)
+                    slot_rect = slot_surface.get_rect()
+                    slot_rect.midbottom = (slot_screen[0], slot_screen[1] - 6)
+                    slot_bg_rect = slot_rect.inflate(12, 8)
+                    slot_bg_surface = pygame.Surface(slot_bg_rect.size, pygame.SRCALPHA)
+                    slot_bg_surface.fill((255, 255, 255, 220))
+                    screen.blit(slot_bg_surface, slot_bg_rect.topleft)
+                    screen.blit(slot_surface, slot_rect.topleft)
 
                 if len(traj) >= 2:
                     pts = [world_to_screen(x, y, world, sw, sh) for (x, y) in traj]
@@ -2782,6 +2832,15 @@ def main():
                 screen.blit(hud3_img, (12, 44))
                 hint_img = font.render(hud_hint, True, (70, 70, 70))
                 screen.blit(hint_img, (sw - hint_img.get_width() - 16, 44))
+
+                requirement_text = f"요구사항: {orientation_label}"
+                requirement_surface = fonts["requirement"].render(requirement_text, True, requirement_color)
+                requirement_y = max(12, vp_oy - requirement_surface.get_height() - 12)
+                requirement_pos = (
+                    vp_ox + (vp_w - requirement_surface.get_width()) // 2,
+                    requirement_y,
+                )
+                screen.blit(requirement_surface, requirement_pos)
 
                 if paused:
                     stats_lines = [
@@ -2892,39 +2951,16 @@ def main():
             draw_collision_markers(screen, collision_markers, world, sw, sh)
 
         title = "SUCCESS" if why == "success" else ("TIMEOUT" if why == "timeout" else "COLLISION" if why == "collision" else "QUIT")
-        stage_label = stage_profile.get("label", f"{stage_idx}단계")
-        avg_speed = score_details.get("avg_speed", 0.0)
         score_cap = score_details.get("score_cap", 100.0)
         info_lines = []
         info_lines.append(f"총점 {score_value:.1f} / {score_cap:.0f}")
-        if why == "success":
-            perf = score_details.get("performance_component", 0.0)
-            safe_base = score_details.get("safe_base", 50.0)
-            info_lines.append(f"구성: 안전 {safe_base:.0f} + 성과 {perf:.1f}")
-        info_lines.append(f"{stage_label} · {AVAILABLE_MAPS[selected_map_idx]['name']}")
+        perf = score_details.get("performance_component", 0.0)
+        safe_base = score_details.get("safe_base", 50.0)
+        info_lines.append(f"구성: 안전 {safe_base:.0f} + 성과 {perf:.1f}")
 
-        info_lines.append("")
-        info_lines.append(f"주행 시간 {round_stats.elapsed:.1f}s")
-        info_lines.append(f"이동 거리 {round_stats.distance:.1f}m")
-        info_lines.append(f"평균 속도 {avg_speed:.2f}m/s")
-        info_lines.append(f"기어 전환 {round_stats.gear_switches}회")
-        info_lines.append(f"충돌 {collision_count}회")
-        info_lines.append(f"조향 방향 전환 {round_stats.direction_flips}회")
-        orientation_label = {
-            "front_in": "전면 주차",
-            "rear_in": "후면 주차",
-            "unknown": "방향 불확실",
-        }.get(round_stats.final_orientation, round_stats.final_orientation or "방향 불확실")
-        info_lines.append(f"주차 방향 {orientation_label}")
-        expected_orientation = stage_profile.get("expected_orientation")
-        if expected_orientation:
-            expected_label = {
-                "front_in": "전면 요구",
-                "rear_in": "후면 요구",
-            }.get(expected_orientation, expected_orientation)
-            info_lines.append(f"요구 방향 {expected_label}")
-        info_lines.append(f"IoU {round_stats.final_iou * 100:.1f}% / 기준 {PARKING_SUCCESS_IOU * 100:.0f}%")
-        info_lines.append(f"정지 속도 {round_stats.final_speed:.2f}m/s")
+        iou_value = score_details.get("parking_iou")
+        if isinstance(iou_value, (int, float)):
+            info_lines.append(f"IoU {iou_value * 100:.1f}%")
 
         component_scores = score_details.get("component_scores", {}) or {}
         if component_scores:
@@ -2933,7 +2969,6 @@ def main():
             component_labels = {
                 "time": "시간",
                 "distance": "이동 거리",
-                "turn": "기어 전환",
                 "speed": "평균 속도",
                 "steer_flip": "조향 전환",
                 "parking_iou": "슬롯 적합도",
@@ -2950,7 +2985,6 @@ def main():
             diag = math.hypot(xmax - xmin, ymax - ymin)
             time_target = stage_profile.get("time_target", 0.0)
             distance_target = diag * stage_profile.get("distance_factor", 1.0)
-            turn_target = stage_profile.get("turn_target", 0)
             speed_target = stage_profile.get("speed_target", 0.0)
             steer_flip_target = stage_profile.get("steer_flip_target", 0)
             info_lines.append("")
@@ -2958,56 +2992,8 @@ def main():
             if time_target > 0:
                 info_lines.append(f"- 시간 {round_stats.elapsed:.1f}s / {time_target:.1f}s")
             info_lines.append(f"- 거리 {round_stats.distance:.1f}m / {distance_target:.1f}m")
-            info_lines.append(f"- 기어 전환 {round_stats.gear_switches}회 / {turn_target}회")
-            info_lines.append(f"- 평균 속도 {avg_speed:.2f}m/s / {speed_target:.2f}m/s")
+            info_lines.append(f"- 평균 속도 {score_details.get('avg_speed', 0.0):.2f}m/s / {speed_target:.2f}m/s")
             info_lines.append(f"- 조향 전환 {round_stats.direction_flips}회 / {steer_flip_target}회")
-
-        info_lines.append("")
-        info_lines.append(f"맵 시드: {map_seed if map_seed is not None else '-'}")
-        if control_mode == "ipc":
-            if ipc and ipc.is_connected:
-                peer = f"{ipc.peer[0]}:{ipc.peer[1]}" if ipc.peer else f"{args.host}:{args.port}"
-                info_lines.append(f"IPC 연결: {peer}")
-            else:
-                info_lines.append(f"IPC 대기: {args.host}:{args.port}")
-        if replay_path:
-            info_lines.append(f"리플레이: {replay_path}")
-
-        if RECENT_RESULTS:
-            info_lines.append("")
-            info_lines.append("최근 3회 기록")
-            reason_map = {
-                "success": "성공",
-                "collision": "충돌",
-                "timeout": "시간초과",
-                "quit": "종료",
-            }
-            for entry in reversed(RECENT_RESULTS):
-                label = entry.get("stage_label", "")
-                reason_text = reason_map.get(entry.get("reason"), entry.get("reason", ""))
-                info_lines.append(f"- {label} {entry.get('map', '')}: {entry.get('score', 0.0):.1f}점 ({reason_text})")
-                details = entry.get("details", {}) or {}
-                iou = details.get("parking_iou")
-                orientation = details.get("parking_orientation")
-                expected = details.get("expected_orientation")
-                final_speed = details.get("final_speed")
-                if isinstance(iou, (int, float)):
-                    info_lines.append(f"    · IoU {iou * 100:.1f}%")
-                if orientation:
-                    orientation_label = {
-                        "front_in": "전면",
-                        "rear_in": "후면",
-                        "unknown": "불확실",
-                    }.get(orientation, orientation)
-                    info_lines.append(f"    · 방향 {orientation_label}")
-                if expected:
-                    expected_label = {
-                        "front_in": "요구 전면",
-                        "rear_in": "요구 후면",
-                    }.get(expected, expected)
-                    info_lines.append(f"    · {expected_label}")
-                if isinstance(final_speed, (int, float)):
-                    info_lines.append(f"    · 정지 속도 {final_speed:.2f}m/s")
 
         draw_overlay(screen, title, info_lines, font, sw, sh)
         pygame.display.flip()
